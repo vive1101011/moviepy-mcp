@@ -1,0 +1,23 @@
+[project]
+name = "moviepy-mcp"
+version = "0.1.0"
+description = "LLM-friendly MCP server for video and audio editing, built on MoviePy v2 and FastMCP"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Vivek" }]
+keywords = ["mcp", "moviepy", "video", "audio", "editing", "llm", "agent"]
+dependencies = [
+    "fastmcp>=2.0",
+    "moviepy>=2.1",
+]
+
+[project.scripts]
+moviepy-mcp = "moviepy_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moviepy_mcp"]
