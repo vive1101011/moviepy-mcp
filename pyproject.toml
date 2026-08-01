@@ -10,6 +10,8 @@ keywords = ["mcp", "moviepy", "video", "audio", "editing", "llm", "agent"]
 dependencies = [
     "fastmcp>=2.0",
     "moviepy>=2.1",
+    "pillow>=10",
+    "yt-dlp>=2024.1.0",
 ]
 
 [project.scripts]

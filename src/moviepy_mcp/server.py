@@ -20,9 +20,11 @@ Design principles
 from __future__ import annotations
 
 import os
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP
 from moviepy import (
@@ -43,9 +45,10 @@ mcp = FastMCP(
     name="moviepy",
     instructions=(
         "Video/audio editing server. Workflow: load media with load_video / "
-        "load_audio / load_image (returns a clip_id), transform it with the "
-        "editing tools (each returns a NEW clip_id — always use the latest "
-        "id for the next step), then write the result with export_clip. "
+        "load_audio / load_image, or fetch from YouTube/Instagram with "
+        "download_video (returns a clip_id), transform it with the editing "
+        "tools (each returns a NEW clip_id — always use the latest id for the "
+        "next step), then write the result with export_clip. "
         "Use list_clips / get_clip_info to inspect state at any time."
     ),
 )
@@ -121,6 +124,135 @@ def _check_path(path: str) -> str:
     return path
 
 
+_YT_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+             "www.youtu.be", "music.youtube.com")
+_IG_HOSTS = ("instagram.com", "www.instagram.com")
+
+
+def _validate_download_url(url: str) -> str:
+    """Accept YouTube or Instagram http(s) URLs; raise with a clear fix otherwise."""
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("url is required (YouTube or Instagram video URL).")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid url '{url}'. Provide a full http(s) YouTube or Instagram URL.")
+    host = parsed.netloc.lower().split("@")[-1]
+    if host.startswith("www."):
+        host = host[4:]
+    allowed = {h.removeprefix("www.") for h in (_YT_HOSTS + _IG_HOSTS)}
+    if host not in allowed:
+        raise ValueError(
+            f"Unsupported host '{parsed.netloc}'. download_video supports YouTube "
+            "and Instagram only (e.g. https://www.youtube.com/watch?v=... or "
+            "https://www.instagram.com/reel/...).")
+    return url
+
+
+def _resolve_downloaded_path(info: dict[str, Any], prepared: str) -> str:
+    """Find the on-disk file after yt-dlp download (handles merge/ext changes)."""
+    candidates: list[str] = []
+    for entry in info.get("requested_downloads") or []:
+        fp = entry.get("filepath")
+        if fp:
+            candidates.append(fp)
+    if info.get("filepath"):
+        candidates.append(info["filepath"])
+    if info.get("_filename"):
+        candidates.append(info["_filename"])
+    candidates.append(prepared)
+    root, _ = os.path.splitext(prepared)
+    for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3"):
+        candidates.append(root + ext)
+
+    seen: set[str] = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            return path
+    raise ValueError(
+        f"Download finished but no output file was found near '{prepared}'.")
+
+
+def _download_with_ytdlp(url: str, output_dir: str,
+                         cookies_from_browser: Optional[str] = None,
+                         cookies_file: Optional[str] = None) -> tuple[str, dict]:
+    """Download a single video; return (filepath, info_dict)."""
+    import yt_dlp
+
+    os.makedirs(output_dir, exist_ok=True)
+    # Sanitize template: avoid path-breaking chars in titles
+    outtmpl = os.path.join(output_dir, "%(title).80B [%(id)s].%(ext)s")
+    opts: dict[str, Any] = {
+        "outtmpl": outtmpl,
+        "format": "bv*+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+    }
+    if cookies_file:
+        path = os.path.expanduser(cookies_file)
+        if not os.path.isfile(path):
+            raise ValueError(f"cookies_file not found: '{path}'.")
+        opts["cookiefile"] = path
+    if cookies_from_browser:
+        # yt-dlp expects a tuple like ("chrome",) or ("chrome", "Profile 1", ...)
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise ValueError("yt-dlp returned no info for this URL.")
+            if "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                if not entries:
+                    raise ValueError("URL looks like a playlist/feed with no entries.")
+                info = entries[0]
+            prepared = ydl.prepare_filename(info)
+            path = _resolve_downloaded_path(info, prepared)
+            return path, info
+    except yt_dlp.utils.DownloadError as exc:
+        raise ValueError(
+            f"Download failed for '{url}': {exc}. "
+            "For private Instagram posts, pass cookies_from_browser "
+            "(e.g. 'chrome') or cookies_file."
+        ) from exc
+
+
+def _pil_filter(clip: Any, filter_fn: Any) -> Any:
+    """Apply a Pillow filter function to every frame of a clip."""
+    import numpy as np
+    from PIL import Image
+
+    def fl(im: Any) -> Any:
+        arr = np.asarray(im)
+        if arr.dtype != np.uint8:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        out = filter_fn(Image.fromarray(arr))
+        return np.asarray(out)
+
+    return clip.image_transform(fl)
+
+
+def _ensure_uint8(clip: Any) -> Any:
+    """Cast frames to uint8 so Pillow-backed MoviePy effects work on ColorClips."""
+    import numpy as np
+
+    def fl(im: Any) -> Any:
+        arr = np.asarray(im)
+        if arr.dtype == np.uint8:
+            return arr
+        return np.clip(arr, 0, 255).astype(np.uint8)
+
+    return clip.image_transform(fl)
+
+
 # --------------------------------------------------------------------------- #
 # Loading media
 # --------------------------------------------------------------------------- #
@@ -142,6 +274,52 @@ def load_video(path: str, label: Optional[str] = None) -> dict:
     clip_id = _register(clip, "video", label or os.path.basename(path), None,
                         f"load_video({path})")
     return _describe(clip_id)
+
+
+@mcp.tool
+def download_video(url: str, output_dir: Optional[str] = None,
+                   label: Optional[str] = None,
+                   cookies_from_browser: Optional[str] = None,
+                   cookies_file: Optional[str] = None) -> dict:
+    """Download a YouTube or Instagram video and load it into the registry.
+
+    Uses yt-dlp. Public videos work without cookies; private/login-gated
+    Instagram posts may need ``cookies_from_browser`` (e.g. ``chrome``) or
+    ``cookies_file``.
+
+    Args:
+        url: Full YouTube or Instagram video/reel URL.
+        output_dir: Where to save the file (created if missing). Defaults to
+            a ``moviepy-mcp-downloads`` folder under the system temp dir.
+        label: Optional human-readable name for the loaded clip.
+        cookies_from_browser: Browser name for cookie import (chrome, firefox,
+            edge, brave, etc.) — useful for Instagram.
+        cookies_file: Path to a Netscape-format cookies.txt instead.
+
+    Returns:
+        Clip metadata plus ``downloaded_path``, ``source_url``, and ``title``.
+    """
+    url = _validate_download_url(url)
+    if cookies_from_browser and cookies_file:
+        raise ValueError(
+            "Pass only one of cookies_from_browser or cookies_file, not both.")
+    dest = os.path.expanduser(
+        output_dir
+        or os.path.join(tempfile.gettempdir(), "moviepy-mcp-downloads"))
+    path, info = _download_with_ytdlp(
+        url, dest,
+        cookies_from_browser=cookies_from_browser,
+        cookies_file=cookies_file)
+    title = info.get("title") or os.path.basename(path)
+    clip = VideoFileClip(path)
+    clip_id = _register(
+        clip, "video", label or title, None,
+        f"download_video({url})")
+    meta = _describe(clip_id)
+    meta["downloaded_path"] = path
+    meta["source_url"] = url
+    meta["title"] = title
+    return meta
 
 
 @mcp.tool
@@ -501,6 +679,127 @@ def chroma_key(clip_id: str, color_rgb: list[int], threshold: float = 0.0,
     return _describe(nid)
 
 
+@mcp.tool
+def invert_colors(clip_id: str) -> dict:
+    """Invert colors (negative): black becomes white, etc."""
+    entry = _get(clip_id, expect=("video", "image"))
+    new = entry.clip.with_effects([vfx.InvertColors()])
+    nid = _register(new, entry.kind, entry.label, entry, "invert_colors")
+    return _describe(nid)
+
+
+@mcp.tool
+def gamma_correct(clip_id: str, gamma: float) -> dict:
+    """Apply gamma correction. Typical values ~0.5–2.0; gamma must be > 0."""
+    if gamma <= 0:
+        raise ValueError(f"gamma must be > 0, got {gamma}.")
+    entry = _get(clip_id, expect=("video", "image"))
+    new = entry.clip.with_effects([vfx.GammaCorrection(gamma)])
+    nid = _register(new, entry.kind, entry.label, entry, f"gamma({gamma})")
+    return _describe(nid)
+
+
+@mcp.tool
+def multiply_color(clip_id: str, factor: float) -> dict:
+    """Multiply RGB by factor: <1 darkens, >1 brightens. factor must be > 0."""
+    if factor <= 0:
+        raise ValueError(f"factor must be > 0, got {factor}.")
+    entry = _get(clip_id, expect=("video", "image"))
+    new = entry.clip.with_effects([vfx.MultiplyColor(factor)])
+    nid = _register(new, entry.kind, entry.label, entry,
+                    f"multiply_color({factor})")
+    return _describe(nid)
+
+
+@mcp.tool
+def add_margin(clip_id: str, margin_size: Optional[int] = None,
+               left: int = 0, right: int = 0, top: int = 0, bottom: int = 0,
+               color_rgb: Optional[list[int]] = None) -> dict:
+    """Add a colored border/margin around a video or image clip.
+
+    Provide ``margin_size`` for equal margins on all sides, or set individual
+    ``left``/``right``/``top``/``bottom`` pixel values (at least one > 0).
+    """
+    entry = _get(clip_id, expect=("video", "image"))
+    color = color_rgb if color_rgb is not None else [0, 0, 0]
+    if len(color) != 3:
+        raise ValueError(
+            f"color_rgb must be [R, G, B] with 3 ints, got {color!r}.")
+    if margin_size is None and not (left or right or top or bottom):
+        raise ValueError(
+            "Provide margin_size or at least one of left/right/top/bottom > 0.")
+    new = entry.clip.with_effects([
+        vfx.Margin(margin_size=margin_size, left=left, right=right,
+                   top=top, bottom=bottom, color=tuple(color))])
+    op = (f"margin({margin_size})" if margin_size is not None
+          else f"margin(L{left} R{right} T{top} B{bottom})")
+    nid = _register(new, entry.kind, entry.label, entry, op)
+    return _describe(nid)
+
+
+@mcp.tool
+def painting(clip_id: str, saturation: float = 1.4,
+             black: float = 0.006) -> dict:
+    """Stylize a clip to look like a painting.
+
+    Args:
+        saturation: How flashy the colors are (higher = more saturated).
+        black: Amount of black contour (higher = stronger outlines).
+    """
+    entry = _get(clip_id, expect=("video", "image"))
+    new = _ensure_uint8(entry.clip).with_effects(
+        [vfx.Painting(saturation=saturation, black=black)])
+    nid = _register(new, entry.kind, entry.label, entry,
+                    f"painting(sat={saturation}, black={black})")
+    return _describe(nid)
+
+
+@mcp.tool
+def blur(clip_id: str, radius: float = 2.0) -> dict:
+    """Gaussian blur a video/image clip. radius >= 0 (Pillow)."""
+    if radius < 0:
+        raise ValueError(f"radius must be >= 0, got {radius}.")
+    from PIL import ImageFilter
+    entry = _get(clip_id, expect=("video", "image"))
+    new = _pil_filter(
+        entry.clip, lambda img: img.filter(ImageFilter.GaussianBlur(radius)))
+    nid = _register(new, entry.kind, entry.label, entry, f"blur({radius})")
+    return _describe(nid)
+
+
+@mcp.tool
+def sharpen(clip_id: str, percent: int = 150, radius: float = 2.0,
+            threshold: int = 3) -> dict:
+    """Unsharp-mask sharpen a video/image clip (Pillow).
+
+    Args:
+        percent: Strength of sharpening (100 = moderate, 150 = default).
+        radius: Blur radius used by the unsharp mask.
+        threshold: Minimum brightness change to sharpen (0–255).
+    """
+    from PIL import ImageFilter
+    entry = _get(clip_id, expect=("video", "image"))
+    new = _pil_filter(
+        entry.clip,
+        lambda img: img.filter(
+            ImageFilter.UnsharpMask(radius=radius, percent=percent,
+                                    threshold=threshold)))
+    nid = _register(new, entry.kind, entry.label, entry,
+                    f"sharpen(p={percent}, r={radius})")
+    return _describe(nid)
+
+
+@mcp.tool
+def set_opacity(clip_id: str, opacity: float) -> dict:
+    """Set clip opacity for compositing. 0.0 = invisible, 1.0 = fully opaque."""
+    if not 0.0 <= opacity <= 1.0:
+        raise ValueError(f"opacity must be between 0.0 and 1.0, got {opacity}.")
+    entry = _get(clip_id, expect=("video", "image"))
+    new = entry.clip.with_opacity(opacity)
+    nid = _register(new, entry.kind, entry.label, entry, f"opacity({opacity})")
+    return _describe(nid)
+
+
 # --------------------------------------------------------------------------- #
 # Audio operations
 # --------------------------------------------------------------------------- #
@@ -639,6 +938,32 @@ def save_frame(clip_id: str, output_path: str,
     entry.clip.save_frame(output_path, t=time_seconds)
     return {"saved": output_path, "time_seconds": time_seconds,
             "clip_id": clip_id}
+
+
+@mcp.tool
+def export_image(clip_id: str, output_path: str,
+                 time_seconds: float = 0.0) -> dict:
+    """Export a still image file from a video or image clip.
+
+    Args:
+        clip_id: The video or image clip.
+        output_path: Destination path; extension must be .png, .jpg, .jpeg, or .webp.
+        time_seconds: Frame time for video clips (ignored for still images).
+    """
+    entry = _get(clip_id, expect=("video", "image"))
+    output_path = os.path.expanduser(output_path)
+    ext = os.path.splitext(output_path)[1].lower()
+    allowed = {".png", ".jpg", ".jpeg", ".webp"}
+    if ext not in allowed:
+        raise ValueError(
+            f"export_image requires extension in {sorted(allowed)}, got '{ext}'. "
+            "Use save_frame for other formats or export_clip for video/audio.")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    entry.clip.save_frame(output_path, t=time_seconds)
+    size = os.path.getsize(output_path)
+    return {"exported": output_path, "file_size_bytes": size,
+            "time_seconds": time_seconds, "clip_id": clip_id,
+            "history": entry.history}
 
 
 @mcp.tool

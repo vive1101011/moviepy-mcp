@@ -97,14 +97,14 @@ Or without installing, via uv (one-shot deps):
 
 | Category | Tools |
 |---|---|
-| Load / create | `load_video`, `load_audio`, `load_image`, `create_color_clip`, `create_text_clip` |
+| Load / create | `load_video`, `load_audio`, `load_image`, `download_video`, `create_color_clip`, `create_text_clip` |
 | Inspect | `list_clips`, `get_clip_info`, `delete_clip` |
 | Time | `trim`, `concatenate`, `change_speed`, `loop_clip` |
 | Geometry | `resize`, `crop`, `rotate`, `mirror` |
-| Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key` |
+| Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key`, `invert_colors`, `gamma_correct`, `multiply_color`, `add_margin`, `painting`, `blur`, `sharpen`, `set_opacity` |
 | Audio | `set_volume`, `extract_audio`, `remove_audio`, `attach_audio` |
 | Compositing | `overlay_clip` |
-| Output | `save_frame`, `export_clip` |
+| Output | `save_frame`, `export_image`, `export_clip` |
 
 ## Example agent workflow
 
@@ -126,6 +126,7 @@ export_clip(clip_id=..., output_path="final.mp4")
 - Text rendering requires a font; pass `font="/path/to/font.ttf"` to `create_text_clip` if the default is unavailable on your system.
 - GIF export uses `write_gif` (defaults to 12 fps); everything else goes through FFmpeg.
 - The registry lives in server memory — restarting the server clears all clip_ids.
+- `download_video` uses yt-dlp for YouTube and Instagram. Public URLs work as-is; private Instagram media may need `cookies_from_browser` (e.g. `chrome`) or a `cookies_file`. Respect each platform's terms of service and only download content you have rights to use.
 
 ## License
 
