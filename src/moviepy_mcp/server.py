@@ -476,6 +476,31 @@ def adjust_colors(clip_id: str, brightness: float = 0.0,
     return _describe(nid)
 
 
+@mcp.tool
+def chroma_key(clip_id: str, color_rgb: list[int], threshold: float = 0.0,
+               stiffness: float = 1.0) -> dict:
+    """Mask a color in a video clip (chroma key / green screen).
+
+    Args:
+        clip_id: The video or image clip.
+        color_rgb: The color to mask out as [R, G, B], e.g. [0, 255, 0] for green.
+        threshold: Euclidean RGB distance tolerance. 0 = exact color only;
+            try 20–100 for typical green-screen spill.
+        stiffness: Edge sharpness. Higher = harder edges; lower = softer.
+            MoviePy default is 1.0.
+    """
+    entry = _get(clip_id, expect=("video", "image"))
+    if len(color_rgb) != 3:
+        raise ValueError(
+            f"color_rgb must be [R, G, B] with 3 ints, got {color_rgb!r}.")
+    new = entry.clip.with_effects(
+        [vfx.MaskColor(color=tuple(color_rgb), threshold=threshold,
+                       stiffness=stiffness)])
+    nid = _register(new, entry.kind, entry.label, entry,
+                    f"chroma_key(rgb={color_rgb}, t={threshold}, s={stiffness})")
+    return _describe(nid)
+
+
 # --------------------------------------------------------------------------- #
 # Audio operations
 # --------------------------------------------------------------------------- #

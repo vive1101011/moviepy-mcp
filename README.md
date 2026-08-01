@@ -101,7 +101,7 @@ Or without installing, via uv (one-shot deps):
 | Inspect | `list_clips`, `get_clip_info`, `delete_clip` |
 | Time | `trim`, `concatenate`, `change_speed`, `loop_clip` |
 | Geometry | `resize`, `crop`, `rotate`, `mirror` |
-| Visual FX | `fade`, `to_grayscale`, `adjust_colors` |
+| Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key` |
 | Audio | `set_volume`, `extract_audio`, `remove_audio`, `attach_audio` |
 | Compositing | `overlay_clip` |
 | Output | `save_frame`, `export_clip` |
