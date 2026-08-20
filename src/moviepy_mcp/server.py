@@ -10,23 +10,31 @@ Design principles
    until ``export_clip`` is called. This keeps multi-step edits fast.
 2. Non-destructive: source clips are never mutated. Each edit produces a
    new registry entry, so an agent can branch or retry freely.
-3. Structured, self-describing results: every tool returns a dict with
+3. Structured, self-describing results: editing tools return a dict with
    ``clip_id`` plus metadata (duration, size, fps, has_audio) so the
    calling model always knows the current state without extra calls.
+   ``preview_frame`` also returns an image so the model can see the frame.
 4. Fail loudly with actionable messages: errors name the offending
    argument and suggest the fix.
 """
 
 from __future__ import annotations
 
+import asyncio
+import io
+import json
 import os
+import re
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from urllib.parse import urlparse
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
+from fastmcp.tools.tool import ToolResult
+from fastmcp.utilities.types import Image as MCPImage
 from moviepy import (
     AudioFileClip,
     ColorClip,
@@ -36,10 +44,21 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    clips_array,
     concatenate_audioclips,
     concatenate_videoclips,
     vfx,
 )
+
+_POSITIONS = {
+    "center": "center", "top": ("center", "top"),
+    "bottom": ("center", "bottom"), "left": ("left", "center"),
+    "right": ("right", "center"), "top-left": ("left", "top"),
+    "top-right": ("right", "top"), "bottom-left": ("left", "bottom"),
+    "bottom-right": ("right", "bottom"),
+}
+_SLIDE_SIDES = ("top", "bottom", "left", "right")
+_TS_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{1,3})")
 
 mcp = FastMCP(
     name="moviepy",
@@ -48,8 +67,9 @@ mcp = FastMCP(
         "load_audio / load_image, or fetch from YouTube/Instagram with "
         "download_video (returns a clip_id), transform it with the editing "
         "tools (each returns a NEW clip_id — always use the latest id for the "
-        "next step), then write the result with export_clip. "
-        "Use list_clips / get_clip_info to inspect state at any time."
+        "next step), call preview_frame to see a still, then write the result "
+        "with export_clip. Use list_clips / get_clip_info / clip://{id}/info "
+        "to inspect state at any time."
     ),
 )
 
@@ -110,8 +130,9 @@ def _describe(clip_id: str) -> dict[str, Any]:
         "history": entry.history,
     }
     if entry.kind in ("video", "image"):
-        info["size"] = {"width": clip.w, "height": clip.h}
-        info["fps"] = getattr(clip, "fps", None)
+        info["size"] = {"width": int(clip.w), "height": int(clip.h)}
+        fps = getattr(clip, "fps", None)
+        info["fps"] = float(fps) if fps is not None else None
         info["has_audio"] = clip.audio is not None
     return info
 
@@ -179,7 +200,10 @@ def _resolve_downloaded_path(info: dict[str, Any], prepared: str) -> str:
 
 def _download_with_ytdlp(url: str, output_dir: str,
                          cookies_from_browser: Optional[str] = None,
-                         cookies_file: Optional[str] = None) -> tuple[str, dict]:
+                         cookies_file: Optional[str] = None,
+                         on_progress: Optional[Callable[
+                             [float, Optional[float], str], None]] = None,
+                         ) -> tuple[str, dict]:
     """Download a single video; return (filepath, info_dict)."""
     import yt_dlp
 
@@ -195,6 +219,8 @@ def _download_with_ytdlp(url: str, output_dir: str,
         "no_warnings": True,
         "noprogress": True,
     }
+    if on_progress is not None:
+        opts["progress_hooks"] = [_ytdlp_progress_hook(on_progress)]
     if cookies_file:
         path = os.path.expanduser(cookies_file)
         if not os.path.isfile(path):
@@ -253,6 +279,254 @@ def _ensure_uint8(clip: Any) -> Any:
     return clip.image_transform(fl)
 
 
+def _preview_png(clip: Any, time_seconds: float,
+                 max_width: int) -> tuple[bytes, int, int]:
+    """Render one frame to PNG bytes, optionally downscaled for the model."""
+    import numpy as np
+    from PIL import Image as PILImage
+
+    if time_seconds < 0:
+        raise ValueError(f"time_seconds must be >= 0, got {time_seconds}.")
+    duration = getattr(clip, "duration", None)
+    t = time_seconds
+    if duration is not None and duration > 0:
+        # get_frame at t == duration is out of range
+        t = min(t, max(0.0, duration - 1e-6))
+    frame = clip.get_frame(t)
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    img = PILImage.fromarray(arr)
+    w, h = img.size
+    if max_width > 0 and w > max_width:
+        h = max(1, round(h * max_width / w))
+        w = max_width
+        img = img.resize((w, h), PILImage.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), w, h
+
+
+def _bridge_progress(
+    ctx: Context,
+) -> Callable[[float, Optional[float], str], None]:
+    """Sync callback that schedules ctx.report_progress on the running loop."""
+    loop = asyncio.get_running_loop()
+    last_pct = {"v": -1}
+
+    def report(progress: float, total: Optional[float], message: str) -> None:
+        if total and total > 0:
+            pct = int(100 * progress / total)
+            if pct == last_pct["v"] and progress < total:
+                return
+            last_pct["v"] = pct
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ctx.report_progress(progress, total, message),
+                loop,
+            )
+        except RuntimeError:
+            pass
+
+    return report
+
+
+def _ytdlp_progress_hook(
+    on_progress: Callable[[float, Optional[float], str], None],
+) -> Callable[[dict[str, Any]], None]:
+    """Map yt-dlp progress_hooks dicts onto (progress, total, message)."""
+
+    def hook(d: dict[str, Any]) -> None:
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            done = float(d.get("downloaded_bytes") or 0)
+            on_progress(done, float(total) if total else None, "downloading")
+        elif status == "finished":
+            done = float(d.get("total_bytes") or d.get("downloaded_bytes") or 1)
+            on_progress(done, done, "finished")
+
+    return hook
+
+
+def _moviepy_logger(
+    report: Callable[[float, Optional[float], str], None],
+) -> Any:
+    from proglog import ProgressBarLogger
+
+    class Logger(ProgressBarLogger):
+        def bars_callback(self, bar, attr, value, old_value=None):
+            if attr != "index":
+                return
+            total = (self.bars.get(bar) or {}).get("total")
+            if not total:
+                return
+            report(float(value), float(total), str(bar))
+
+    return Logger(min_time_interval=0.25)
+
+
+def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
+                codec: Optional[str], bitrate: Optional[str],
+                logger: Any) -> None:
+    ext = os.path.splitext(output_path)[1].lower()
+    if entry.kind == "audio":
+        kwargs: dict[str, Any] = {"logger": logger}
+        if bitrate:
+            kwargs["bitrate"] = bitrate
+        entry.clip.write_audiofile(output_path, **kwargs)
+        return
+    if ext == ".gif":
+        entry.clip.write_gif(output_path, fps=fps or 12, logger=logger)
+        return
+    clip = entry.clip
+    out_fps = fps or getattr(clip, "fps", None) or 24
+    kwargs = {"fps": out_fps, "logger": logger}
+    if codec:
+        kwargs["codec"] = codec
+    if bitrate:
+        kwargs["bitrate"] = bitrate
+    clip.write_videofile(output_path, **kwargs)
+
+
+def _with_position(clip: Any, position: str = "center",
+                   x: Optional[int] = None, y: Optional[int] = None) -> Any:
+    if x is not None and y is not None:
+        return clip.with_position((x, y))
+    if position not in _POSITIONS:
+        raise ValueError(
+            f"Unknown position '{position}'. Valid: {', '.join(_POSITIONS)}.")
+    return clip.with_position(_POSITIONS[position])
+
+
+def _parse_timestamp(value: str) -> float:
+    match = _TS_RE.search(value.strip())
+    if not match:
+        raise ValueError(
+            f"Cannot parse timestamp '{value}'. Expected H:MM:SS.mmm or "
+            "H:MM:SS,mmm.")
+    hours, minutes, seconds, frac = match.groups()
+    frac = frac.ljust(3, "0")[:3]
+    return (int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+            + int(frac) / 1000.0)
+
+
+def _parse_subtitles(text: str) -> list[tuple[float, float, str]]:
+    """Parse SRT or VTT into (start, end, text) cues."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise ValueError("Subtitle text is empty.")
+    cues: list[tuple[float, float, str]] = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = []
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if not line or line == "WEBVTT" or line.startswith("NOTE") \
+                    or line.startswith("STYLE"):
+                continue
+            lines.append(line)
+        idx = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if idx is None:
+            continue
+        start_raw, end_raw = lines[idx].split("-->", 1)
+        end_raw = end_raw.strip().split()[0]
+        start = _parse_timestamp(start_raw)
+        end = _parse_timestamp(end_raw)
+        body = re.sub(r"<[^>]+>", "", "\n".join(lines[idx + 1:])).strip()
+        if body and end > start:
+            cues.append((start, end, body))
+    if not cues:
+        raise ValueError(
+            "No subtitle cues found. Provide SRT or WebVTT with --> timestamps.")
+    return cues
+
+
+def _make_text_clip(
+    text: str,
+    font_size: int = 48,
+    color: str = "white",
+    bg_color: Optional[str] = None,
+    font: Optional[str] = None,
+    duration_seconds: float = 5.0,
+    stroke_color: Optional[str] = None,
+    stroke_width: float = 0,
+    text_align: str = "left",
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    method: str = "label",
+) -> Any:
+    if width and method == "label":
+        method = "caption"
+    if method not in ("label", "caption"):
+        raise ValueError("method must be 'label' (single line) or 'caption' (wrap).")
+    if method == "caption" and not width:
+        raise ValueError("caption method requires width (wrap width in pixels).")
+    kwargs: dict[str, Any] = dict(
+        text=text, font_size=font_size, color=color,
+        stroke_width=stroke_width, method=method, text_align=text_align,
+    )
+    if bg_color:
+        kwargs["bg_color"] = bg_color
+    if font:
+        kwargs["font"] = _check_path(font)
+    if stroke_color:
+        kwargs["stroke_color"] = stroke_color
+    if width or height:
+        kwargs["size"] = (width, height)
+    try:
+        return TextClip(**kwargs).with_duration(duration_seconds)
+    except Exception as exc:
+        raise ValueError(
+            f"Text rendering failed: {exc}. Pass font= to a .ttf/.otf file."
+        ) from exc
+
+
+def _apply_audio_effect(entry: ClipEntry, effect: Any, op: str) -> dict:
+    if entry.kind == "audio":
+        new = entry.clip.with_effects([effect])
+        kind = "audio"
+    else:
+        if entry.clip.audio is None:
+            raise ValueError(
+                f"clip_id has no audio track. Load audio or attach_audio first.")
+        new = entry.clip.with_audio(entry.clip.audio.with_effects([effect]))
+        kind = "video" if entry.kind == "image" else entry.kind
+    nid = _register(new, kind, entry.label, entry, op)
+    return _describe(nid)
+
+
+def _ken_burns(clip: Any, start_zoom: float, end_zoom: float,
+               start_x: float, start_y: float,
+               end_x: float, end_y: float) -> Any:
+    import numpy as np
+    from PIL import Image as PILImage
+
+    w, h = clip.w, clip.h
+    duration = clip.duration or 1.0
+
+    def fl(gf, t):
+        p = 0.0 if duration <= 0 else min(1.0, max(0.0, t / duration))
+        z = max(start_zoom + (end_zoom - start_zoom) * p, 1.0)
+        cx = (start_x + (end_x - start_x) * p) * (w - 1)
+        cy = (start_y + (end_y - start_y) * p) * (h - 1)
+        cw, ch = w / z, h / z
+        x1 = min(max(0.0, cx - cw / 2), max(0.0, w - cw))
+        y1 = min(max(0.0, cy - ch / 2), max(0.0, h - ch))
+        frame = np.asarray(gf(t))
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        img = PILImage.fromarray(frame)
+        cropped = img.crop((
+            int(round(x1)), int(round(y1)),
+            int(round(x1 + cw)), int(round(y1 + ch)),
+        ))
+        if cropped.size != (w, h):
+            cropped = cropped.resize((w, h), PILImage.Resampling.LANCZOS)
+        return np.asarray(cropped)
+
+    return clip.transform(fl)
+
+
 # --------------------------------------------------------------------------- #
 # Loading media
 # --------------------------------------------------------------------------- #
@@ -277,10 +551,11 @@ def load_video(path: str, label: Optional[str] = None) -> dict:
 
 
 @mcp.tool
-def download_video(url: str, output_dir: Optional[str] = None,
-                   label: Optional[str] = None,
-                   cookies_from_browser: Optional[str] = None,
-                   cookies_file: Optional[str] = None) -> dict:
+async def download_video(url: str, ctx: Context,
+                         output_dir: Optional[str] = None,
+                         label: Optional[str] = None,
+                         cookies_from_browser: Optional[str] = None,
+                         cookies_file: Optional[str] = None) -> dict:
     """Download a YouTube or Instagram video and load it into the registry.
 
     Uses yt-dlp. Public videos work without cookies; private/login-gated
@@ -306,11 +581,20 @@ def download_video(url: str, output_dir: Optional[str] = None,
     dest = os.path.expanduser(
         output_dir
         or os.path.join(tempfile.gettempdir(), "moviepy-mcp-downloads"))
-    path, info = _download_with_ytdlp(
-        url, dest,
-        cookies_from_browser=cookies_from_browser,
-        cookies_file=cookies_file)
+    await ctx.info(f"Downloading {url}")
+    report = _bridge_progress(ctx)
+    loop = asyncio.get_running_loop()
+    path, info = await loop.run_in_executor(
+        None,
+        lambda: _download_with_ytdlp(
+            url, dest,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+            on_progress=report,
+        ),
+    )
     title = info.get("title") or os.path.basename(path)
+    await ctx.info("Loading downloaded file into registry")
     clip = VideoFileClip(path)
     clip_id = _register(
         clip, "video", label or title, None,
@@ -388,6 +672,12 @@ def create_text_clip(text: str, font_size: int = 48,
                      bg_color: Optional[str] = None,
                      font: Optional[str] = None,
                      duration_seconds: float = 5.0,
+                     stroke_color: Optional[str] = None,
+                     stroke_width: float = 0,
+                     text_align: str = "left",
+                     width: Optional[int] = None,
+                     height: Optional[int] = None,
+                     method: str = "label",
                      label: Optional[str] = None) -> dict:
     """Create a standalone text clip (titles, captions, credits).
 
@@ -402,14 +692,20 @@ def create_text_clip(text: str, font_size: int = 48,
         font: Optional path to a .ttf/.otf font file. Uses a default font
             if omitted.
         duration_seconds: How long the text displays.
+        stroke_color: Optional outline color (e.g. 'black').
+        stroke_width: Outline thickness in pixels.
+        text_align: 'left', 'center', or 'right' (used when wrapping).
+        width: Wrap width in pixels. Sets method to caption when given.
+        height: Optional box height for caption layout.
+        method: 'label' (one box) or 'caption' (word-wrap to width).
         label: Optional human-readable name.
     """
-    kwargs: dict[str, Any] = dict(text=text, font_size=font_size, color=color)
-    if bg_color:
-        kwargs["bg_color"] = bg_color
-    if font:
-        kwargs["font"] = _check_path(font)
-    clip = TextClip(**kwargs).with_duration(duration_seconds)
+    clip = _make_text_clip(
+        text=text, font_size=font_size, color=color, bg_color=bg_color,
+        font=font, duration_seconds=duration_seconds,
+        stroke_color=stroke_color, stroke_width=stroke_width,
+        text_align=text_align, width=width, height=height, method=method,
+    )
     clip_id = _register(clip, "video", label or f"text:{text[:24]}", None,
                         "create_text_clip")
     return _describe(clip_id)
@@ -435,6 +731,40 @@ def get_clip_info(clip_id: str) -> dict:
 
 
 @mcp.tool
+def preview_frame(clip_id: str, time_seconds: float = 0.0,
+                  max_width: int = 640) -> ToolResult:
+    """Return a still frame as an image so the model can see the edit.
+
+    Does not write a file. Downscales so the image fits in context; pass
+    max_width=0 for native resolution.
+
+    Args:
+        clip_id: Video or image clip.
+        time_seconds: Timestamp to grab (clamped to the clip duration).
+        max_width: Max preview width in pixels. 0 = do not downscale.
+            Default 640.
+    """
+    if max_width < 0:
+        raise ValueError("max_width must be >= 0 (0 = native resolution).")
+    entry = _get(clip_id, expect=("video", "image"))
+    duration = entry.clip.duration
+    if time_seconds < 0:
+        raise ValueError(f"time_seconds must be >= 0, got {time_seconds}.")
+    if duration is not None and time_seconds > duration:
+        raise ValueError(
+            f"time_seconds {time_seconds} is past duration {duration}s. "
+            f"Use a time in [0, {duration}].")
+    data, w, h = _preview_png(entry.clip, time_seconds, max_width)
+    meta = _describe(clip_id)
+    meta["time_seconds"] = time_seconds
+    meta["preview_size"] = {"width": w, "height": h}
+    return ToolResult(
+        content=[MCPImage(data=data, format="png").to_image_content()],
+        structured_content=meta,
+    )
+
+
+@mcp.tool
 def delete_clip(clip_id: str) -> dict:
     """Remove a clip from the registry and free its resources."""
     entry = _get(clip_id)
@@ -444,6 +774,21 @@ def delete_clip(clip_id: str) -> dict:
         pass
     del _REGISTRY[clip_id]
     return {"deleted": clip_id, "remaining_clips": len(_REGISTRY)}
+
+
+@mcp.resource("clip://{clip_id}/info", mime_type="application/json")
+def clip_info_resource(clip_id: str) -> str:
+    """JSON metadata for a registered clip."""
+    _get(clip_id)
+    return json.dumps(_describe(clip_id))
+
+
+@mcp.resource("clip://{clip_id}/frame", mime_type="image/png")
+def clip_frame_resource(clip_id: str) -> bytes:
+    """PNG of the first frame (downscaled to 640px). Use preview_frame for other times."""
+    entry = _get(clip_id, expect=("video", "image"))
+    data, _, _ = _preview_png(entry.clip, 0.0, max_width=640)
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -533,6 +878,88 @@ def loop_clip(clip_id: str, n_times: Optional[int] = None,
     return _describe(nid)
 
 
+@mcp.tool
+def reverse_clip(clip_id: str) -> dict:
+    """Play a clip backwards (video, image sequence, or audio)."""
+    entry = _get(clip_id)
+    if not entry.clip.duration:
+        raise ValueError("Clip has no duration; cannot reverse.")
+    new = entry.clip.with_effects([vfx.TimeMirror()])
+    nid = _register(new, entry.kind, entry.label, entry, "reverse")
+    return _describe(nid)
+
+
+@mcp.tool
+def freeze(clip_id: str, freeze_duration_seconds: Optional[float] = None,
+           total_duration_seconds: Optional[float] = None,
+           time_seconds: float = 0.0, at_end: bool = False) -> dict:
+    """Hold a frame, inserting freeze_duration extra seconds at that time.
+
+    Give freeze_duration_seconds OR total_duration_seconds (clip + freeze).
+    at_end=True freezes the last frame (ignores time_seconds).
+    """
+    if freeze_duration_seconds is None and total_duration_seconds is None:
+        raise ValueError(
+            "Provide freeze_duration_seconds or total_duration_seconds.")
+    if freeze_duration_seconds is not None and freeze_duration_seconds <= 0:
+        raise ValueError("freeze_duration_seconds must be > 0.")
+    entry = _get(clip_id, expect=("video", "image"))
+    duration = entry.clip.duration
+    if not duration:
+        raise ValueError("Clip has no duration; cannot freeze.")
+    t: Any = time_seconds
+    if at_end:
+        t = max(0.0, duration - 1e-6)
+    elif time_seconds < 0 or time_seconds > duration:
+        raise ValueError(
+            f"time_seconds {time_seconds} is outside [0, {duration}].")
+    new = entry.clip.with_effects([
+        vfx.Freeze(t=t, freeze_duration=freeze_duration_seconds,
+                   total_duration=total_duration_seconds),
+    ])
+    nid = _register(new, "video", entry.label, entry, "freeze")
+    return _describe(nid)
+
+
+@mcp.tool
+def crossfade(clip_ids: list[str], overlap_seconds: float) -> dict:
+    """Join video clips with a dissolve instead of a hard cut.
+
+    Each pair overlaps for overlap_seconds (CrossFadeOut + CrossFadeIn).
+    Result duration is sum(durations) - (n-1)*overlap.
+    """
+    if len(clip_ids) < 2:
+        raise ValueError("Provide at least two clip_ids to crossfade.")
+    if overlap_seconds <= 0:
+        raise ValueError(
+            "overlap_seconds must be > 0. Use concatenate for a hard cut.")
+    entries = [_get(cid, expect=("video", "image")) for cid in clip_ids]
+    for entry in entries:
+        dur = entry.clip.duration or 0
+        if dur <= overlap_seconds:
+            raise ValueError(
+                f"Clip '{entry.label}' duration {dur}s must be greater than "
+                f"overlap_seconds {overlap_seconds}s.")
+    placed = []
+    t = 0.0
+    last = len(entries) - 1
+    for i, entry in enumerate(entries):
+        clip = entry.clip
+        effects = []
+        if i > 0:
+            effects.append(vfx.CrossFadeIn(overlap_seconds))
+        if i < last:
+            effects.append(vfx.CrossFadeOut(overlap_seconds))
+        if effects:
+            clip = clip.with_effects(effects)
+        placed.append(clip.with_start(t))
+        t += entry.clip.duration - overlap_seconds
+    new = CompositeVideoClip(placed)
+    nid = _register(new, "video", "crossfade", entries[0],
+                    f"crossfade(overlap={overlap_seconds})")
+    return _describe(nid)
+
+
 # --------------------------------------------------------------------------- #
 # Geometry
 # --------------------------------------------------------------------------- #
@@ -596,6 +1023,15 @@ def mirror(clip_id: str, axis: str = "horizontal") -> dict:
     effect = vfx.MirrorX() if axis == "horizontal" else vfx.MirrorY()
     new = entry.clip.with_effects([effect])
     nid = _register(new, entry.kind, entry.label, entry, f"mirror {axis}")
+    return _describe(nid)
+
+
+@mcp.tool
+def even_size(clip_id: str) -> dict:
+    """Crop 1px off odd width/height so H.264 export does not fail."""
+    entry = _get(clip_id, expect=("video", "image"))
+    new = entry.clip.with_effects([vfx.EvenSize()])
+    nid = _register(new, entry.kind, entry.label, entry, "even_size")
     return _describe(nid)
 
 
@@ -800,6 +1236,109 @@ def set_opacity(clip_id: str, opacity: float) -> dict:
     return _describe(nid)
 
 
+@mcp.tool
+def freeze_region(clip_id: str, x1: int, y1: int, x2: int, y2: int,
+                  time_seconds: float = 0.0) -> dict:
+    """Freeze pixels inside (x1,y1)-(x2,y2) while the rest keeps playing."""
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("Region must have x2 > x1 and y2 > y1.")
+    entry = _get(clip_id, expect=("video", "image"))
+    duration = entry.clip.duration or 0
+    if time_seconds < 0 or (duration and time_seconds > duration):
+        raise ValueError(
+            f"time_seconds {time_seconds} is outside [0, {duration}].")
+    new = entry.clip.with_effects([
+        vfx.FreezeRegion(t=time_seconds, region=(x1, y1, x2, y2)),
+    ])
+    nid = _register(new, "video", entry.label, entry, "freeze_region")
+    return _describe(nid)
+
+
+@mcp.tool
+def slide_in(clip_id: str, duration_seconds: float,
+             side: str = "left") -> dict:
+    """Slide the clip in from one side. Use with overlay_clip or concatenate.
+
+    side: 'top', 'bottom', 'left', or 'right'.
+    """
+    if side not in _SLIDE_SIDES:
+        raise ValueError(f"side must be one of {_SLIDE_SIDES}, got '{side}'.")
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be > 0.")
+    entry = _get(clip_id, expect=("video", "image"))
+    dur = entry.clip.duration or 0
+    if dur and duration_seconds > dur:
+        raise ValueError("slide duration cannot exceed clip duration.")
+    slid = entry.clip.with_effects([vfx.SlideIn(duration_seconds, side)])
+    new = CompositeVideoClip([slid])
+    nid = _register(new, "video", entry.label, entry, f"slide_in({side})")
+    return _describe(nid)
+
+
+@mcp.tool
+def slide_out(clip_id: str, duration_seconds: float,
+              side: str = "right") -> dict:
+    """Slide the clip out toward one side. Use with overlay_clip or concatenate.
+
+    side: 'top', 'bottom', 'left', or 'right'.
+    """
+    if side not in _SLIDE_SIDES:
+        raise ValueError(f"side must be one of {_SLIDE_SIDES}, got '{side}'.")
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be > 0.")
+    entry = _get(clip_id, expect=("video", "image"))
+    dur = entry.clip.duration or 0
+    if dur and duration_seconds > dur:
+        raise ValueError("slide duration cannot exceed clip duration.")
+    slid = entry.clip.with_effects([vfx.SlideOut(duration_seconds, side)])
+    new = CompositeVideoClip([slid])
+    nid = _register(new, "video", entry.label, entry, f"slide_out({side})")
+    return _describe(nid)
+
+
+@mcp.tool
+def scroll(clip_id: str, x_speed: float = 0.0, y_speed: float = 0.0,
+           width: Optional[int] = None, height: Optional[int] = None,
+           x_start: float = 0.0, y_start: float = 0.0) -> dict:
+    """Scroll a clip (end credits, pan). Speeds are pixels per second."""
+    if x_speed == 0 and y_speed == 0:
+        raise ValueError("Provide x_speed and/or y_speed (pixels per second).")
+    entry = _get(clip_id, expect=("video", "image"))
+    kwargs: dict[str, Any] = dict(
+        x_speed=x_speed, y_speed=y_speed, x_start=x_start, y_start=y_start,
+    )
+    if width is not None:
+        kwargs["w"] = width
+    if height is not None:
+        kwargs["h"] = height
+    new = entry.clip.with_effects([vfx.Scroll(**kwargs)])
+    nid = _register(new, "video", entry.label, entry,
+                    f"scroll(x={x_speed}, y={y_speed})")
+    return _describe(nid)
+
+
+@mcp.tool
+def ken_burns(clip_id: str, start_zoom: float = 1.0, end_zoom: float = 1.2,
+              start_x: float = 0.5, start_y: float = 0.5,
+              end_x: float = 0.5, end_y: float = 0.5) -> dict:
+    """Slow zoom/pan (Ken Burns). Output size matches the source.
+
+    Zoom must be >= 1. x/y are normalized focal points (0=left/top, 1=right/bottom).
+    """
+    if start_zoom < 1 or end_zoom < 1:
+        raise ValueError("start_zoom and end_zoom must be >= 1 (1 = no zoom).")
+    for name, value in (("start_x", start_x), ("start_y", start_y),
+                        ("end_x", end_x), ("end_y", end_y)):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be in [0, 1], got {value}.")
+    entry = _get(clip_id, expect=("video", "image"))
+    new = _ken_burns(entry.clip, start_zoom, end_zoom,
+                     start_x, start_y, end_x, end_y)
+    nid = _register(new, "video", entry.label, entry,
+                    f"ken_burns({start_zoom}->{end_zoom})")
+    return _describe(nid)
+
+
 # --------------------------------------------------------------------------- #
 # Audio operations
 # --------------------------------------------------------------------------- #
@@ -817,6 +1356,54 @@ def set_volume(clip_id: str, factor: float) -> dict:
     new = entry.clip.with_volume_scaled(factor)
     nid = _register(new, entry.kind, entry.label, entry, f"volume x{factor}")
     return _describe(nid)
+
+
+@mcp.tool
+def normalize_audio(clip_id: str) -> dict:
+    """Normalize volume to 0 dB. Works on audio clips and video soundtracks."""
+    entry = _get(clip_id)
+    return _apply_audio_effect(entry, afx.AudioNormalize(), "normalize_audio")
+
+
+@mcp.tool
+def delay_audio(clip_id: str, offset_seconds: float = 0.2,
+                n_repeats: int = 8, decay: float = 1.0) -> dict:
+    """Echo: repeat the audio n_repeats times, offset_seconds apart.
+
+    decay < 1 fades repeats. Works on audio clips and video soundtracks.
+    """
+    if offset_seconds <= 0:
+        raise ValueError("offset_seconds must be > 0.")
+    if n_repeats < 1:
+        raise ValueError("n_repeats must be >= 1.")
+    entry = _get(clip_id)
+    return _apply_audio_effect(
+        entry,
+        afx.AudioDelay(offset=offset_seconds, n_repeats=n_repeats, decay=decay),
+        f"delay_audio({offset_seconds}x{n_repeats})",
+    )
+
+
+@mcp.tool
+def set_stereo_volume(clip_id: str, left: float = 1.0,
+                      right: float = 1.0) -> dict:
+    """Set left/right channel gain (pan). Needs a stereo track.
+
+    1.0 = unchanged, 0 = mute that side. Works on audio or video-with-audio.
+    """
+    if left < 0 or right < 0:
+        raise ValueError("left and right must be >= 0.")
+    entry = _get(clip_id)
+    try:
+        return _apply_audio_effect(
+            entry, afx.MultiplyStereoVolume(left=left, right=right),
+            f"stereo_volume(L={left}, R={right})")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            f"set_stereo_volume needs a stereo audio track: {exc}"
+        ) from exc
 
 
 @mcp.tool
@@ -899,24 +1486,88 @@ def overlay_clip(base_clip_id: str, overlay_clip_id: str,
         over = over.with_opacity(opacity)
     over = over.with_start(start_seconds)
 
-    if x is not None and y is not None:
-        over = over.with_position((x, y))
-    else:
-        mapping = {
-            "center": "center", "top": ("center", "top"),
-            "bottom": ("center", "bottom"), "left": ("left", "center"),
-            "right": ("right", "center"), "top-left": ("left", "top"),
-            "top-right": ("right", "top"), "bottom-left": ("left", "bottom"),
-            "bottom-right": ("right", "bottom"),
-        }
-        if position not in mapping:
-            raise ValueError(f"Unknown position '{position}'. "
-                             f"Valid: {', '.join(mapping)}")
-        over = over.with_position(mapping[position])
+    over = _with_position(over, position, x, y)
 
     new = CompositeVideoClip([base.clip, over])
     nid = _register(new, "video", base.label, base,
                     f"overlay({over_entry.label} @ {position})")
+    return _describe(nid)
+
+
+@mcp.tool
+def grid_clips(clip_ids: list[str], columns: int,
+               bg_color_rgb: Optional[list[int]] = None) -> dict:
+    """Lay clips out left-to-right, wrapping every ``columns`` (side-by-side / 2x2).
+
+    Clips are resized to the first clip's size. len(clip_ids) must divide evenly
+    by columns.
+    """
+    if columns < 1:
+        raise ValueError("columns must be >= 1.")
+    if len(clip_ids) < 2:
+        raise ValueError("Provide at least two clip_ids.")
+    if len(clip_ids) % columns != 0:
+        raise ValueError(
+            f"{len(clip_ids)} clips does not fill a grid of {columns} columns. "
+            "Add clips or change columns.")
+    entries = [_get(cid, expect=("video", "image")) for cid in clip_ids]
+    target = (entries[0].clip.w, entries[0].clip.h)
+    cells = []
+    for entry in entries:
+        clip = entry.clip
+        if (clip.w, clip.h) != target:
+            clip = clip.resized(new_size=target)
+        cells.append(clip)
+    rows = [cells[i:i + columns] for i in range(0, len(cells), columns)]
+    kwargs: dict[str, Any] = {}
+    if bg_color_rgb is not None:
+        kwargs["bg_color"] = tuple(bg_color_rgb)
+    new = clips_array(rows, **kwargs)
+    nid = _register(new, "video", "grid", entries[0],
+                    f"grid({len(rows)}x{columns})")
+    return _describe(nid)
+
+
+@mcp.tool
+def add_subtitles(clip_id: str, srt_text: Optional[str] = None,
+                  srt_path: Optional[str] = None,
+                  font_size: int = 32, color: str = "white",
+                  font: Optional[str] = None,
+                  stroke_color: str = "black", stroke_width: float = 2,
+                  position: str = "bottom") -> dict:
+    """Burn SRT or WebVTT cues onto a video as timed captions."""
+    if bool(srt_text) == bool(srt_path):
+        raise ValueError("Pass exactly one of srt_text or srt_path.")
+    if srt_path:
+        path = _check_path(srt_path)
+        with open(path, encoding="utf-8") as fh:
+            srt_text = fh.read()
+    cues = _parse_subtitles(srt_text or "")
+    base = _get(clip_id, expect=("video", "image"))
+    base_dur = base.clip.duration or 0
+    wrap_w = max(1, int(base.clip.w * 0.9))
+    layers = [base.clip]
+    for start, end, body in cues:
+        if start >= base_dur:
+            continue
+        end = min(end, base_dur) if base_dur else end
+        if end <= start:
+            continue
+        caption = _make_text_clip(
+            text=body, font_size=font_size, color=color, font=font,
+            duration_seconds=end - start, stroke_color=stroke_color,
+            stroke_width=stroke_width, text_align="center", width=wrap_w,
+            method="caption",
+        )
+        caption = _with_position(caption, position).with_start(start)
+        layers.append(caption)
+    if len(layers) == 1:
+        raise ValueError("No cues fall within the clip duration.")
+    new = CompositeVideoClip(layers)
+    if base_dur:
+        new = new.with_duration(base_dur)
+    nid = _register(new, "video", base.label, base,
+                    f"subtitles({len(layers) - 1} cues)")
     return _describe(nid)
 
 
@@ -930,7 +1581,8 @@ def save_frame(clip_id: str, output_path: str,
                time_seconds: float = 0.0) -> dict:
     """Save a single frame of a video as an image (png/jpg).
 
-    Useful for thumbnails or letting the user preview an edit.
+    Writes a file. Prefer ``preview_frame`` when the model needs to see
+    the edit without touching disk.
     """
     entry = _get(clip_id, expect=("video", "image"))
     output_path = os.path.expanduser(output_path)
@@ -967,9 +1619,10 @@ def export_image(clip_id: str, output_path: str,
 
 
 @mcp.tool
-def export_clip(clip_id: str, output_path: str, fps: Optional[float] = None,
-                codec: Optional[str] = None,
-                bitrate: Optional[str] = None) -> dict:
+async def export_clip(clip_id: str, output_path: str, ctx: Context,
+                      fps: Optional[float] = None,
+                      codec: Optional[str] = None,
+                      bitrate: Optional[str] = None) -> dict:
     """Render a clip to disk. THIS is the step that writes a file.
 
     Args:
@@ -986,21 +1639,17 @@ def export_clip(clip_id: str, output_path: str, fps: Optional[float] = None,
     entry = _get(clip_id)
     output_path = os.path.expanduser(output_path)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    ext = os.path.splitext(output_path)[1].lower()
 
-    if entry.kind == "audio":
-        entry.clip.write_audiofile(output_path, bitrate=bitrate)
-    elif ext == ".gif":
-        entry.clip.write_gif(output_path, fps=fps or 12)
-    else:
-        clip = entry.clip
-        out_fps = fps or getattr(clip, "fps", None) or 24
-        kwargs: dict[str, Any] = {"fps": out_fps, "logger": None}
-        if codec:
-            kwargs["codec"] = codec
-        if bitrate:
-            kwargs["bitrate"] = bitrate
-        clip.write_videofile(output_path, **kwargs)
+    await ctx.info(f"Exporting {clip_id} to {output_path}")
+    await ctx.report_progress(0, None, "starting export")
+    report = _bridge_progress(ctx)
+    logger = _moviepy_logger(report)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _write_clip(entry, output_path, fps, codec, bitrate, logger),
+    )
+    await ctx.report_progress(1, 1, "export complete")
 
     size = os.path.getsize(output_path)
     return {"exported": output_path, "file_size_bytes": size,

@@ -98,12 +98,12 @@ Or without installing, via uv (one-shot deps):
 | Category | Tools |
 |---|---|
 | Load / create | `load_video`, `load_audio`, `load_image`, `download_video`, `create_color_clip`, `create_text_clip` |
-| Inspect | `list_clips`, `get_clip_info`, `delete_clip` |
-| Time | `trim`, `concatenate`, `change_speed`, `loop_clip` |
-| Geometry | `resize`, `crop`, `rotate`, `mirror` |
-| Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key`, `invert_colors`, `gamma_correct`, `multiply_color`, `add_margin`, `painting`, `blur`, `sharpen`, `set_opacity` |
-| Audio | `set_volume`, `extract_audio`, `remove_audio`, `attach_audio` |
-| Compositing | `overlay_clip` |
+| Inspect | `list_clips`, `get_clip_info`, `preview_frame`, `delete_clip` |
+| Time | `trim`, `concatenate`, `crossfade`, `change_speed`, `loop_clip`, `reverse_clip`, `freeze` |
+| Geometry | `resize`, `crop`, `rotate`, `mirror`, `even_size` |
+| Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key`, `invert_colors`, `gamma_correct`, `multiply_color`, `add_margin`, `painting`, `blur`, `sharpen`, `set_opacity`, `freeze_region`, `slide_in`, `slide_out`, `scroll`, `ken_burns` |
+| Audio | `set_volume`, `normalize_audio`, `delay_audio`, `set_stereo_volume`, `extract_audio`, `remove_audio`, `attach_audio` |
+| Compositing | `overlay_clip`, `grid_clips`, `add_subtitles` |
 | Output | `save_frame`, `export_image`, `export_clip` |
 
 ## Example agent workflow
@@ -117,7 +117,7 @@ load_video(path="intro.mp4")                          -> video_a1b2c3d4
 trim(clip_id="video_a1b2c3d4", start_seconds=5, end_seconds=20)
 create_text_clip(text="Q2 Review", font_size=64, duration_seconds=4)
 overlay_clip(base_clip_id=..., overlay_clip_id=..., position="top")
-fade(clip_id=..., fade_out_seconds=1.5)
+preview_frame(clip_id=..., time_seconds=0)
 export_clip(clip_id=..., output_path="final.mp4")
 ```
 
@@ -126,6 +126,10 @@ export_clip(clip_id=..., output_path="final.mp4")
 - Text rendering requires a font; pass `font="/path/to/font.ttf"` to `create_text_clip` if the default is unavailable on your system.
 - GIF export uses `write_gif` (defaults to 12 fps); everything else goes through FFmpeg.
 - The registry lives in server memory — restarting the server clears all clip_ids.
+- `preview_frame` returns an image to the model (downscaled to 640px by default). Use it after edits to verify before `export_clip`.
+- Clip metadata and a first-frame PNG are resources: `clip://{clip_id}/info` and `clip://{clip_id}/frame`.
+- `crossfade` dissolves overlapping clips; `concatenate` is still a hard cut.
+- `even_size` crops odd dimensions (H.264). `add_subtitles` accepts SRT or WebVTT via `srt_text` or `srt_path`.
 - `download_video` uses yt-dlp for YouTube and Instagram. Public URLs work as-is; private Instagram media may need `cookies_from_browser` (e.g. `chrome`) or a `cookies_file`. Respect each platform's terms of service and only download content you have rights to use.
 
 ## License
