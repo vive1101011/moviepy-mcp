@@ -436,6 +436,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5f/67/3cef84ba38a23dca1e1e776bfda8a35ab3c7a6c94a8ca81d0715de6dd3c5/fastmcp-3.4.4-py3-none-any.whl", hash = "sha256:f86f208713212260068cf55c32936839eee856fefc7808e18a032f31eb0f718e", size = 8019, upload-time = "2026-07-09T00:32:39.411Z" },
 ]
 
+[package.optional-dependencies]
+apps = [
+    { name = "fastmcp-slim", extra = ["apps"] },
+]
+
 [[package]]
 name = "fastmcp-slim"
 version = "3.4.4"
@@ -454,6 +459,9 @@ wheels = [
 ]
 
 [package.optional-dependencies]
+apps = [
+    { name = "prefab-ui" },
+]
 client = [
     { name = "authlib" },
     { name = "exceptiongroup" },
@@ -808,7 +816,7 @@ name = "moviepy-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "fastmcp" },
+    { name = "fastmcp", extra = ["apps"] },
     { name = "moviepy" },
     { name = "pillow" },
     { name = "yt-dlp" },
@@ -822,7 +830,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=2.0" },
+    { name = "fastmcp", extras = ["apps"], specifier = ">=2.0" },
     { name = "moviepy", specifier = ">=2.1" },
     { name = "pillow", specifier = ">=10" },
     { name = "yt-dlp", specifier = ">=2024.1.0" },
@@ -1200,6 +1208,20 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prefab-ui"
+version = "0.20.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cyclopts" },
+    { name = "pydantic" },
+    { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/99/4e61eb3d3f8b09bdaa28bda3c99971264555f486a485333cb8e6f56c7d8c/prefab_ui-0.20.2.tar.gz", hash = "sha256:4ac17ebf8ec1c5a918a188625837fc608157907430a59c4feb8adac80e01262b", size = 4118979, upload-time = "2026-06-03T02:13:49.312Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/d0/59b697dd5a44e632fcc4aba42ff5f88224df672ffea1f5e9a5a9e9e50698/prefab_ui-0.20.2-py3-none-any.whl", hash = "sha256:861d4914e4d9120996b4d5c6753788beeca433754d7bb3cfbd13f9dba7ea8e85", size = 1852274, upload-time = "2026-06-03T02:13:47.539Z" },
 ]
 
 [[package]]
