@@ -135,6 +135,7 @@ export_clip(clip_id=..., output_path="final.mp4")
 - `create_slideshow` builds a video from a list of image paths in one call, with optional crossfade transitions and background audio (looped or trimmed to fit).
 - `mix_audio_tracks` layers audio clips simultaneously (voice + music + SFX) with per-track volume; `concatenate` still plays clips one after another.
 - `remove_silence` cuts near-silent gaps out of an audio or video clip (podcast/vlog jump-cut editing) based on a loudness threshold and minimum gap length.
+- `save_frame` and `export_image` take `at_end=True` to grab the last frame without knowing the exact duration.
 
 ## License
 

@@ -389,6 +389,14 @@ def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
     clip.write_videofile(output_path, **kwargs)
 
 
+def _last_frame_time(clip: Any) -> float:
+    """A timestamp just before the end, safe to pass to get_frame/save_frame."""
+    duration = getattr(clip, "duration", None)
+    if not duration:
+        raise ValueError("Clip has no duration; cannot locate the last frame.")
+    return max(0.0, duration - 1e-6)
+
+
 def _with_position(clip: Any, position: str = "center",
                    x: Optional[int] = None, y: Optional[int] = None) -> Any:
     if x is not None and y is not None:
@@ -1844,29 +1852,38 @@ def add_subtitles(clip_id: str, srt_text: Optional[str] = None,
 
 @mcp.tool
 def save_frame(clip_id: str, output_path: str,
-               time_seconds: float = 0.0) -> dict:
+               time_seconds: float = 0.0, at_end: bool = False) -> dict:
     """Save a single frame of a video as an image (png/jpg).
 
     Writes a file. Prefer ``preview_frame`` when the model needs to see
     the edit without touching disk.
+
+    Args:
+        clip_id: The video or image clip.
+        output_path: Destination path.
+        time_seconds: Frame time to grab (0.0 = first frame). Ignored if
+            at_end=True.
+        at_end: Grab the last frame instead of a specific time.
     """
     entry = _get(clip_id, expect=("video", "image"))
     output_path = os.path.expanduser(output_path)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    entry.clip.save_frame(output_path, t=time_seconds)
-    return {"saved": output_path, "time_seconds": time_seconds,
-            "clip_id": clip_id}
+    t = _last_frame_time(entry.clip) if at_end else time_seconds
+    entry.clip.save_frame(output_path, t=t)
+    return {"saved": output_path, "time_seconds": t, "clip_id": clip_id}
 
 
 @mcp.tool
 def export_image(clip_id: str, output_path: str,
-                 time_seconds: float = 0.0) -> dict:
+                 time_seconds: float = 0.0, at_end: bool = False) -> dict:
     """Export a still image file from a video or image clip.
 
     Args:
         clip_id: The video or image clip.
         output_path: Destination path; extension must be .png, .jpg, .jpeg, or .webp.
-        time_seconds: Frame time for video clips (ignored for still images).
+        time_seconds: Frame time for video clips (ignored for still images,
+            and ignored if at_end=True).
+        at_end: Grab the last frame instead of a specific time.
     """
     entry = _get(clip_id, expect=("video", "image"))
     output_path = os.path.expanduser(output_path)
@@ -1877,10 +1894,11 @@ def export_image(clip_id: str, output_path: str,
             f"export_image requires extension in {sorted(allowed)}, got '{ext}'. "
             "Use save_frame for other formats or export_clip for video/audio.")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    entry.clip.save_frame(output_path, t=time_seconds)
+    t = _last_frame_time(entry.clip) if at_end else time_seconds
+    entry.clip.save_frame(output_path, t=t)
     size = os.path.getsize(output_path)
     return {"exported": output_path, "file_size_bytes": size,
-            "time_seconds": time_seconds, "clip_id": clip_id,
+            "time_seconds": t, "clip_id": clip_id,
             "history": entry.history}
 
 

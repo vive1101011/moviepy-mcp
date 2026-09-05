@@ -622,6 +622,22 @@ async def test_save_frame_writes_file(tmp_path: Path):
         assert out_path.stat().st_size > 0
 
 
+async def test_save_frame_at_end_grabs_last_frame(tmp_path: Path):
+    async with Client(mcp) as client:
+        created = await _color(client, width=16, height=16, duration=0.5)
+        out_path = tmp_path / "last.png"
+        out = _data(
+            await client.call_tool(
+                "save_frame",
+                {"clip_id": created["clip_id"], "output_path": str(out_path),
+                 "at_end": True},
+            )
+        )
+        assert out["time_seconds"] < 0.5
+        assert out["time_seconds"] > 0.49
+        assert out_path.stat().st_size > 0
+
+
 async def test_export_image_writes_file():
     async with Client(mcp) as client:
         created = await _color(client, width=16, height=16)
@@ -644,6 +660,21 @@ async def test_export_image_writes_png(tmp_path: Path):
             )
         )
         assert out["exported"] == str(out_path)
+        assert out["file_size_bytes"] > 0
+
+
+async def test_export_image_at_end_grabs_last_frame(tmp_path: Path):
+    async with Client(mcp) as client:
+        created = await _color(client, width=16, height=16, duration=0.5)
+        out_path = tmp_path / "last.png"
+        out = _data(
+            await client.call_tool(
+                "export_image",
+                {"clip_id": created["clip_id"], "output_path": str(out_path),
+                 "at_end": True},
+            )
+        )
+        assert out["time_seconds"] < 0.5
         assert out["file_size_bytes"] > 0
 
 
