@@ -21,19 +21,26 @@ Design principles
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import io
 import json
+import mimetypes
 import os
 import re
+import shutil
 import tempfile
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 from fastmcp import Context, FastMCP
+from fastmcp.apps.file_upload import FileUpload
 from fastmcp.tools.tool import ToolResult
+from fastmcp.utilities.types import File as MCPFile
 from fastmcp.utilities.types import Image as MCPImage
 from moviepy import (
     AudioFileClip,
@@ -64,12 +71,15 @@ mcp = FastMCP(
     name="moviepy",
     instructions=(
         "Video/audio editing server. Workflow: load media with load_video / "
-        "load_audio / load_image, or fetch from YouTube/Instagram with "
-        "download_video (returns a clip_id), transform it with the editing "
-        "tools (each returns a NEW clip_id — always use the latest id for the "
-        "next step), call preview_frame to see a still, then write the result "
-        "with export_clip. Use list_clips / get_clip_info / clip://{id}/info "
-        "to inspect state at any time."
+        "load_audio / load_image (server-local paths), upload_media (base64 "
+        "bytes when the client has no shared filesystem with the server), or "
+        "fetch from YouTube/Instagram with download_video (returns a "
+        "clip_id), transform it with the editing tools (each returns a NEW "
+        "clip_id — always use the latest id for the next step), call "
+        "preview_frame to see a still, then write the result with "
+        "export_clip (server-local path) or download_media (returns the "
+        "rendered bytes inline, capped at 20 MB). Use list_clips / "
+        "get_clip_info / clip://{id}/info to inspect state at any time."
     ),
 )
 
@@ -143,6 +153,76 @@ def _check_path(path: str) -> str:
         raise ValueError(f"File not found: '{path}'. Provide an absolute path "
                          "to an existing file.")
     return path
+
+
+_UPLOAD_DIR_NAME = "moviepy-mcp-uploads"
+_MAX_INLINE_BYTES = 20 * 1024 * 1024  # 20 MB cap for download_media's inline transfer
+_STILL_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v", ".flv", ".wmv",
+               ".gif"}
+_AUDIO_EXTS = {".mp3", ".wav", ".aac", ".ogg", ".m4a", ".flac", ".wma"}
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+
+
+def _detect_kind(ext: str) -> Optional[str]:
+    if ext in _VIDEO_EXTS:
+        return "video"
+    if ext in _AUDIO_EXTS:
+        return "audio"
+    if ext in _IMAGE_EXTS:
+        return "image"
+    return None
+
+
+def _default_media_dir(name: str) -> str:
+    return os.path.join(tempfile.gettempdir(), name)
+
+
+def _decode_base64(data_base64: str) -> bytes:
+    if not data_base64:
+        raise ValueError("data_base64 is required and must not be empty.")
+    try:
+        raw = base64.b64decode(data_base64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"data_base64 is not valid base64: {exc}") from exc
+    if not raw:
+        raise ValueError("Decoded file is empty.")
+    return raw
+
+
+def _store_upload(filename: str, raw: bytes, kind: Optional[str] = None,
+                  label: Optional[str] = None,
+                  output_dir: Optional[str] = None) -> tuple[str, str]:
+    """Write uploaded bytes to disk and load them into the clip registry.
+
+    Returns (clip_id, saved_path).
+    """
+    filename = os.path.basename((filename or "").strip())
+    if not filename:
+        raise ValueError("filename is required (e.g. 'clip.mp4').")
+    ext = os.path.splitext(filename)[1].lower()
+    detected = kind or _detect_kind(ext)
+    if detected not in ("video", "audio", "image"):
+        raise ValueError(
+            f"Cannot determine media kind from filename '{filename}'. "
+            "Pass kind='video', 'audio', or 'image' explicitly.")
+
+    dest_dir = os.path.expanduser(
+        output_dir or _default_media_dir(_UPLOAD_DIR_NAME))
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, f"{uuid.uuid4().hex[:8]}_{filename}")
+    with open(dest_path, "wb") as fh:
+        fh.write(raw)
+
+    if detected == "video":
+        clip: Any = VideoFileClip(dest_path)
+    elif detected == "audio":
+        clip = AudioFileClip(dest_path)
+    else:
+        clip = ImageClip(dest_path)
+    clip_id = _register(clip, detected, label or filename, None,
+                        f"upload_media({filename})")
+    return clip_id, dest_path
 
 
 _YT_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -656,6 +736,120 @@ async def download_video(url: str, ctx: Context,
     meta["source_url"] = url
     meta["title"] = title
     return meta
+
+
+@mcp.tool
+def upload_media(filename: str, data_base64: str,
+                 kind: Optional[str] = None,
+                 output_dir: Optional[str] = None,
+                 label: Optional[str] = None) -> dict:
+    """Upload raw media bytes and load them into the registry.
+
+    Use this instead of load_video/load_audio/load_image when the calling
+    client has the file's bytes in memory but no filesystem path the server
+    can read (e.g. a browser-based or remote MCP client). Encode the file
+    as base64 and pass it here; the bytes are written to a server-managed
+    file (moviepy needs a real file on disk to stream from) and loaded.
+
+    Args:
+        filename: Original filename, used to pick the file extension and
+            (unless kind is given) to guess whether it's video/audio/image.
+        data_base64: The file contents, base64-encoded.
+        kind: Force 'video', 'audio', or 'image' instead of guessing from
+            filename's extension.
+        output_dir: Where to save the decoded file. Defaults to a
+            moviepy-mcp-uploads folder under the system temp dir.
+        label: Optional human-readable name for the clip.
+
+    Returns:
+        Clip metadata plus ``saved_path`` and ``file_size_bytes``.
+    """
+    raw = _decode_base64(data_base64)
+    clip_id, dest_path = _store_upload(filename, raw, kind=kind, label=label,
+                                       output_dir=output_dir)
+    meta = _describe(clip_id)
+    meta["saved_path"] = dest_path
+    meta["file_size_bytes"] = len(raw)
+    return meta
+
+
+def _format_upload_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+class MediaUpload(FileUpload):
+    """Drag-and-drop video/audio/image upload rendered inside the chat UI.
+
+    Built on fastmcp's ``FileUpload`` app (requires ``fastmcp[apps]``).
+    Dropped files never enter the model's context window: bytes are
+    decoded straight to a server-side file and loaded into the clip
+    registry via ``_store_upload`` (the same path ``upload_media`` uses),
+    and only the resulting ``clip_id`` plus lightweight metadata are
+    surfaced to the model.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="Media",
+            max_file_size=500 * 1024 * 1024,
+            title="Upload Media",
+            description=(
+                "Drop a video, audio, or image file to load it into the "
+                "editor. Once uploaded, tell the model the clip_id shown "
+                "below to start editing it."
+            ),
+            drop_label="Drop video, audio, or image files here",
+        )
+
+    def _summarize(self, entry: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "name": entry["name"],
+            "type": entry["type"],
+            "file_size_bytes": entry["file_size_bytes"],
+            "size_display": _format_upload_size(entry["file_size_bytes"]),
+            "uploaded_at": entry["uploaded_at"],
+            "clip_id": entry["clip_id"],
+        }
+
+    def on_store(self, files: list[dict[str, Any]],
+                ctx: Context) -> list[dict[str, Any]]:
+        scope = self._get_scope_key(ctx)
+        session_files = self._store.setdefault(scope, {})
+        for f in files:
+            name = os.path.basename(f.get("name") or "")
+            raw = _decode_base64(f.get("data", ""))
+            clip_id, _saved_path = _store_upload(name, raw)
+            session_files[name] = {
+                "name": name,
+                "type": f.get("type") or _REGISTRY[clip_id].kind,
+                "file_size_bytes": len(raw),
+                "clip_id": clip_id,
+                "uploaded_at": datetime.now(timezone.utc)
+                .isoformat(timespec="seconds"),
+            }
+        return [self._summarize(e) for e in session_files.values()]
+
+    def on_list(self, ctx: Context) -> list[dict[str, Any]]:
+        scope = self._get_scope_key(ctx)
+        return [self._summarize(e) for e in self._store.get(scope, {}).values()]
+
+    def on_read(self, name: str, ctx: Context) -> dict[str, Any]:
+        scope = self._get_scope_key(ctx)
+        session_files = self._store.get(scope, {})
+        if name not in session_files:
+            available = list(session_files)
+            raise ValueError(f"File {name!r} not found. Available: {available}")
+        entry = session_files[name]
+        result = self._summarize(entry)
+        result.update(_describe(entry["clip_id"]))
+        return result
+
+
+mcp.add_provider(MediaUpload())
 
 
 @mcp.tool
@@ -1938,6 +2132,90 @@ async def export_clip(clip_id: str, output_path: str, ctx: Context,
     size = os.path.getsize(output_path)
     return {"exported": output_path, "file_size_bytes": size,
             "clip_id": clip_id, "history": entry.history}
+
+
+@mcp.tool
+async def download_media(clip_id: str, format: str, ctx: Context,
+                         fps: Optional[float] = None,
+                         codec: Optional[str] = None,
+                         bitrate: Optional[str] = None,
+                         time_seconds: float = 0.0,
+                         at_end: bool = False) -> ToolResult:
+    """Render a clip and return the file bytes inline, instead of to disk.
+
+    Use this instead of export_clip when the calling client cannot read a
+    path on the server's filesystem: it renders to a temporary file, reads
+    the bytes back, deletes the temp file, and returns the data as an
+    embedded resource (base64) plus metadata. Inline transfer is capped at
+    20 MB — for larger output, use export_clip with a path the client (or a
+    shared mount) can read.
+
+    Args:
+        clip_id: The clip to render.
+        format: Output file extension without the dot (e.g. 'mp4', 'mp3',
+            'gif', 'png'). A still-image format (png/jpg/jpeg/webp) renders
+            one frame instead of the whole clip and needs a video/image
+            clip_id.
+        fps: Frames per second for video (defaults to source fps or 24).
+            Ignored for still-image formats.
+        codec: Optional codec override (e.g. 'libx264', 'libvpx'). Ignored
+            for still-image formats.
+        bitrate: Optional bitrate (e.g. '4000k'). Ignored for still-image
+            formats.
+        time_seconds: Frame time to grab, for still-image formats only.
+        at_end: Grab the last frame instead of time_seconds (still-image
+            formats only).
+
+    Returns:
+        The rendered file as inline content, plus metadata.
+    """
+    entry = _get(clip_id)
+    ext = "." + format.strip().lstrip(".").lower()
+    if not format.strip():
+        raise ValueError("format is required (e.g. 'mp4', 'mp3', 'png').")
+    is_still = ext in _STILL_IMAGE_EXTS
+    if is_still and entry.kind not in ("video", "image"):
+        raise ValueError(
+            f"format '{format}' needs a video or image clip_id, but "
+            f"'{clip_id}' is a {entry.kind} clip.")
+
+    tmp_dir = tempfile.mkdtemp(prefix="moviepy-mcp-dl-")
+    try:
+        tmp_path = os.path.join(tmp_dir, f"{clip_id}{ext}")
+        if is_still:
+            t = _last_frame_time(entry.clip) if at_end else time_seconds
+            entry.clip.save_frame(tmp_path, t=t)
+        else:
+            await ctx.info(f"Rendering {clip_id} as {ext}")
+            await ctx.report_progress(0, None, "starting render")
+            report = _bridge_progress(ctx)
+            logger = _moviepy_logger(report)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: _write_clip(entry, tmp_path, fps, codec, bitrate,
+                                    logger),
+            )
+            await ctx.report_progress(1, 1, "render complete")
+
+        size = os.path.getsize(tmp_path)
+        if size > _MAX_INLINE_BYTES:
+            raise ValueError(
+                f"Rendered file is {size} bytes, over the "
+                f"{_MAX_INLINE_BYTES}-byte inline transfer limit. Use "
+                "export_clip with a path the client can read instead.")
+        with open(tmp_path, "rb") as fh:
+            data = fh.read()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    meta = _describe(clip_id)
+    meta["format"] = ext.lstrip(".")
+    meta["file_size_bytes"] = size
+    mime_type = mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream"
+    resource = MCPFile(data=data, format=ext.lstrip("."),
+                       name=clip_id).to_resource_content(mime_type=mime_type)
+    return ToolResult(content=[resource], structured_content=meta)
 
 
 def main() -> None:

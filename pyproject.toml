@@ -8,7 +8,7 @@ license = { text = "MIT" }
 authors = [{ name = "Vivek" }]
 keywords = ["mcp", "moviepy", "video", "audio", "editing", "llm", "agent"]
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp[apps]>=2.0",
     "moviepy>=2.1",
     "pillow>=10",
     "yt-dlp>=2024.1.0",
