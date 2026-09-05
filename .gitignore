@@ -1,4 +1,7 @@
-src/moviepy_mcp/__pycache__/__init__.cpython-313.pyc
-src/moviepy_mcp/__pycache__/server.cpython-313.pyc
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
 graphify-out/*
 .kilo/plans/1785579398338-chroma-key-plan.md

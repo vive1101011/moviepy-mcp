@@ -97,12 +97,12 @@ Or without installing, via uv (one-shot deps):
 
 | Category | Tools |
 |---|---|
-| Load / create | `load_video`, `load_audio`, `load_image`, `download_video`, `create_color_clip`, `create_text_clip` |
+| Load / create | `load_video`, `load_audio`, `load_image`, `download_video`, `create_color_clip`, `create_text_clip`, `create_slideshow` |
 | Inspect | `list_clips`, `get_clip_info`, `preview_frame`, `delete_clip` |
 | Time | `trim`, `concatenate`, `crossfade`, `change_speed`, `loop_clip`, `reverse_clip`, `freeze` |
-| Geometry | `resize`, `crop`, `rotate`, `mirror`, `even_size` |
+| Geometry | `resize`, `crop`, `rotate`, `mirror`, `even_size`, `reframe` |
 | Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key`, `invert_colors`, `gamma_correct`, `multiply_color`, `add_margin`, `painting`, `blur`, `sharpen`, `set_opacity`, `freeze_region`, `slide_in`, `slide_out`, `scroll`, `ken_burns` |
-| Audio | `set_volume`, `normalize_audio`, `delay_audio`, `set_stereo_volume`, `extract_audio`, `remove_audio`, `attach_audio` |
+| Audio | `set_volume`, `normalize_audio`, `delay_audio`, `set_stereo_volume`, `extract_audio`, `remove_audio`, `attach_audio`, `mix_audio_tracks`, `remove_silence` |
 | Compositing | `overlay_clip`, `grid_clips`, `add_subtitles` |
 | Output | `save_frame`, `export_image`, `export_clip` |
 
@@ -131,6 +131,11 @@ export_clip(clip_id=..., output_path="final.mp4")
 - `crossfade` dissolves overlapping clips; `concatenate` is still a hard cut.
 - `even_size` crops odd dimensions (H.264). `add_subtitles` accepts SRT or WebVTT via `srt_text` or `srt_path`.
 - `download_video` uses yt-dlp for YouTube and Instagram. Public URLs work as-is; private Instagram media may need `cookies_from_browser` (e.g. `chrome`) or a `cookies_file`. Respect each platform's terms of service and only download content you have rights to use.
+- `reframe` changes aspect ratio for Shorts/Reels-style output: `mode="crop"` center-crops to fill, `mode="pad_blur"` keeps the whole frame and fills the bars with a blurred, zoomed copy.
+- `create_slideshow` builds a video from a list of image paths in one call, with optional crossfade transitions and background audio (looped or trimmed to fit).
+- `mix_audio_tracks` layers audio clips simultaneously (voice + music + SFX) with per-track volume; `concatenate` still plays clips one after another.
+- `remove_silence` cuts near-silent gaps out of an audio or video clip (podcast/vlog jump-cut editing) based on a loudness threshold and minimum gap length.
+- `save_frame` and `export_image` take `at_end=True` to grab the last frame without knowing the exact duration.
 
 ## License
 
