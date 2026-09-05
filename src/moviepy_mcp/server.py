@@ -527,6 +527,50 @@ def _ken_burns(clip: Any, start_zoom: float, end_zoom: float,
     return clip.transform(fl)
 
 
+def _rms_db(chunk: Any) -> float:
+    """RMS loudness of a mono float sample array, in dBFS."""
+    import math
+
+    import numpy as np
+
+    if chunk.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(np.square(chunk))))
+    if rms <= 1e-9:
+        return -120.0
+    return 20.0 * math.log10(rms)
+
+
+def _detect_silence(audio: Any, threshold_db: float, min_silence_seconds: float,
+                    window_seconds: float = 0.05) -> list[tuple[float, float]]:
+    """Return (start, end) intervals of near-silence >= min_silence_seconds."""
+    duration = audio.duration or 0.0
+    if duration <= 0:
+        return []
+    fps = 22050
+    array = audio.to_soundarray(fps=fps)
+    if array.ndim > 1:
+        array = array.mean(axis=1)
+    window = max(1, int(window_seconds * fps))
+    n_windows = max(1, len(array) // window) if len(array) else 0
+    flags = [
+        _rms_db(array[i * window:(i + 1) * window]) < threshold_db
+        for i in range(n_windows)
+    ]
+    intervals: list[tuple[float, float]] = []
+    start_idx: Optional[int] = None
+    for i, flag in enumerate(flags + [False]):
+        if flag and start_idx is None:
+            start_idx = i
+        elif not flag and start_idx is not None:
+            start_t = start_idx * window_seconds
+            end_t = min(i * window_seconds, duration)
+            if end_t - start_t >= min_silence_seconds:
+                intervals.append((start_t, end_t))
+            start_idx = None
+    return intervals
+
+
 # --------------------------------------------------------------------------- #
 # Loading media
 # --------------------------------------------------------------------------- #
@@ -709,6 +753,71 @@ def create_text_clip(text: str, font_size: int = 48,
     clip_id = _register(clip, "video", label or f"text:{text[:24]}", None,
                         "create_text_clip")
     return _describe(clip_id)
+
+
+@mcp.tool
+def create_slideshow(image_paths: list[str], duration_seconds: float = 3.0,
+                     transition_seconds: float = 0.0,
+                     audio_clip_id: Optional[str] = None,
+                     label: Optional[str] = None) -> dict:
+    """Build a video slideshow from a list of images in one call.
+
+    Loads each image, shows it for duration_seconds, optionally crossfades
+    between slides, and optionally lays background audio under the whole
+    thing (looped or trimmed to match the slideshow length).
+
+    Args:
+        image_paths: Absolute paths to image files, in slide order (>= 2).
+        duration_seconds: How long each image displays (before any overlap).
+        transition_seconds: Crossfade overlap between consecutive slides;
+            0 = hard cuts.
+        audio_clip_id: Optional audio clip_id (from load_audio) to attach as
+            background music, looped or trimmed to the slideshow's length.
+        label: Optional human-readable name.
+    """
+    if len(image_paths) < 2:
+        raise ValueError("Provide at least two image_paths.")
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be > 0.")
+    if transition_seconds < 0:
+        raise ValueError("transition_seconds must be >= 0.")
+    if transition_seconds >= duration_seconds:
+        raise ValueError(
+            "transition_seconds must be less than duration_seconds.")
+
+    clips = [ImageClip(_check_path(p)).with_duration(duration_seconds)
+             for p in image_paths]
+
+    if transition_seconds > 0:
+        placed = []
+        t = 0.0
+        last = len(clips) - 1
+        for i, clip in enumerate(clips):
+            effects = []
+            if i > 0:
+                effects.append(vfx.CrossFadeIn(transition_seconds))
+            if i < last:
+                effects.append(vfx.CrossFadeOut(transition_seconds))
+            if effects:
+                clip = clip.with_effects(effects)
+            placed.append(clip.with_start(t))
+            t += duration_seconds - transition_seconds
+        video = CompositeVideoClip(placed)
+    else:
+        video = concatenate_videoclips(clips, method="compose")
+
+    if audio_clip_id is not None:
+        aentry = _get(audio_clip_id, expect=("audio",))
+        audio = aentry.clip
+        if audio.duration and audio.duration < video.duration:
+            audio = audio.with_effects([afx.AudioLoop(duration=video.duration)])
+        elif audio.duration and audio.duration > video.duration:
+            audio = audio.subclipped(0, video.duration)
+        video = video.with_audio(audio)
+
+    nid = _register(video, "video", label or "slideshow", None,
+                    f"create_slideshow({len(image_paths)} images)")
+    return _describe(nid)
 
 
 # --------------------------------------------------------------------------- #
@@ -1032,6 +1141,61 @@ def even_size(clip_id: str) -> dict:
     entry = _get(clip_id, expect=("video", "image"))
     new = entry.clip.with_effects([vfx.EvenSize()])
     nid = _register(new, entry.kind, entry.label, entry, "even_size")
+    return _describe(nid)
+
+
+@mcp.tool
+def reframe(clip_id: str, width: int, height: int,
+           mode: str = "crop") -> dict:
+    """Change a clip's aspect ratio (e.g. 1080x1920 for Shorts/Reels).
+
+    Args:
+        clip_id: Source video/image clip.
+        width: Target width in pixels.
+        height: Target height in pixels.
+        mode: 'crop' (center-crop to fill the target box, cropping off the
+            sides/top/bottom that don't fit) or 'pad_blur' (shrink the whole
+            frame to fit inside the target with no content lost, filling the
+            remaining bars with a blurred, zoomed copy of the same frame).
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be > 0.")
+    if mode not in ("crop", "pad_blur"):
+        raise ValueError(f"mode must be 'crop' or 'pad_blur', got '{mode}'.")
+    entry = _get(clip_id, expect=("video", "image"))
+    clip = entry.clip
+    src_w, src_h = clip.w, clip.h
+    target_ratio = width / height
+    src_ratio = src_w / src_h
+
+    if mode == "crop":
+        if src_ratio > target_ratio:
+            new_w, new_h = round(src_h * target_ratio), src_h
+        else:
+            new_w, new_h = src_w, round(src_w / target_ratio)
+        x1 = (src_w - new_w) // 2
+        y1 = (src_h - new_h) // 2
+        new = clip.cropped(x1=x1, y1=y1, x2=x1 + new_w, y2=y1 + new_h) \
+                  .resized(new_size=(width, height))
+        kind = entry.kind
+    else:
+        from PIL import ImageFilter
+        fit_scale = min(width / src_w, height / src_h)
+        fg = clip.resized(new_size=(round(src_w * fit_scale),
+                                    round(src_h * fit_scale))) \
+                  .with_position("center")
+        cover_scale = max(width / src_w, height / src_h)
+        bg = clip.resized(new_size=(round(src_w * cover_scale),
+                                    round(src_h * cover_scale)))
+        bx1 = (bg.w - width) // 2
+        by1 = (bg.h - height) // 2
+        bg = bg.cropped(x1=bx1, y1=by1, x2=bx1 + width, y2=by1 + height)
+        bg = _pil_filter(_ensure_uint8(bg),
+                         lambda img: img.filter(ImageFilter.GaussianBlur(25)))
+        new = CompositeVideoClip([bg, fg], size=(width, height))
+        kind = "video"
+    nid = _register(new, kind, entry.label, entry,
+                    f"reframe({width}x{height}, {mode})")
     return _describe(nid)
 
 
@@ -1407,6 +1571,73 @@ def set_stereo_volume(clip_id: str, left: float = 1.0,
 
 
 @mcp.tool
+def remove_silence(clip_id: str, silence_threshold_db: float = -40.0,
+                   min_silence_seconds: float = 0.5,
+                   padding_seconds: float = 0.1) -> dict:
+    """Cut silent gaps out of a clip (podcast/vlog jump-cut editing).
+
+    Analyzes the clip's audio track, finds runs of near-silence at least
+    min_silence_seconds long, and removes them — video and audio stay in
+    sync when clip_id is a video.
+
+    Args:
+        clip_id: Audio clip, or video clip with an audio track.
+        silence_threshold_db: Loudness below this (dBFS) counts as silence.
+            Typical range: -50 (very sensitive) to -30 (only near-total
+            silence).
+        min_silence_seconds: Minimum gap length to remove.
+        padding_seconds: Seconds of the silent gap kept on each side of a
+            cut, so words are not clipped.
+    """
+    if min_silence_seconds <= 0:
+        raise ValueError("min_silence_seconds must be > 0.")
+    if padding_seconds < 0:
+        raise ValueError("padding_seconds must be >= 0.")
+    entry = _get(clip_id)
+    audio = entry.clip if entry.kind == "audio" else entry.clip.audio
+    if audio is None:
+        raise ValueError("clip_id has no audio track to analyze.")
+    duration = entry.clip.duration or 0.0
+    if not duration:
+        raise ValueError("Clip has no duration.")
+
+    silences = _detect_silence(audio, silence_threshold_db, min_silence_seconds)
+    if not silences:
+        raise ValueError(
+            "No silence found at or above min_silence_seconds with this "
+            "threshold. Try a higher silence_threshold_db (e.g. -30) or a "
+            "shorter min_silence_seconds.")
+
+    keep: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in silences:
+        cut_start = min(duration, start + padding_seconds)
+        cut_end = max(0.0, end - padding_seconds)
+        if cut_start < cut_end:
+            if cut_start > cursor:
+                keep.append((cursor, cut_start))
+            cursor = cut_end
+    if cursor < duration:
+        keep.append((cursor, duration))
+    keep = [(s, e) for s, e in keep if e - s > 1e-3]
+    if not keep:
+        raise ValueError(
+            "Removing silence would leave nothing; lower min_silence_seconds "
+            "or padding_seconds.")
+
+    segments = [entry.clip.subclipped(s, e) for s, e in keep]
+    if len(segments) == 1:
+        new = segments[0]
+    elif entry.kind == "audio":
+        new = concatenate_audioclips(segments)
+    else:
+        new = concatenate_videoclips(segments, method="compose")
+    nid = _register(new, entry.kind, entry.label, entry,
+                    f"remove_silence({len(silences)} gaps)")
+    return _describe(nid)
+
+
+@mcp.tool
 def extract_audio(clip_id: str) -> dict:
     """Pull the audio track out of a video as a new audio clip."""
     entry = _get(clip_id, expect=("video",))
@@ -1447,6 +1678,41 @@ def attach_audio(video_clip_id: str, audio_clip_id: str,
         audio = audio.subclipped(0, ventry.clip.duration)
     new = ventry.clip.with_audio(audio)
     nid = _register(new, "video", ventry.label, ventry, "attach_audio")
+    return _describe(nid)
+
+
+@mcp.tool
+def mix_audio_tracks(clip_ids: list[str],
+                     volumes: Optional[list[float]] = None) -> dict:
+    """Layer multiple audio tracks together (voice + music + SFX).
+
+    Unlike ``concatenate`` (which plays clips one after another), this plays
+    them simultaneously, all starting at t=0. Use ``extract_audio`` first if
+    any input is a video's audio track. Result duration is the longest input.
+
+    Args:
+        clip_ids: Two or more audio clip_ids to mix.
+        volumes: Optional per-clip volume multipliers, same length as
+            clip_ids (e.g. [1.0, 0.3] to duck background music under voice).
+            Defaults to 1.0 for every track.
+    """
+    if len(clip_ids) < 2:
+        raise ValueError("Provide at least two clip_ids to mix.")
+    if volumes is not None and len(volumes) != len(clip_ids):
+        raise ValueError(
+            f"volumes must have the same length as clip_ids "
+            f"({len(clip_ids)}), got {len(volumes)}.")
+    entries = [_get(cid, expect=("audio",)) for cid in clip_ids]
+    tracks = []
+    for i, entry in enumerate(entries):
+        clip = entry.clip
+        vol = volumes[i] if volumes else 1.0
+        if vol != 1.0:
+            clip = clip.with_volume_scaled(vol)
+        tracks.append(clip)
+    new = CompositeAudioClip(tracks)
+    nid = _register(new, "audio", "mixed", entries[0],
+                    f"mix_audio_tracks({len(clip_ids)})")
     return _describe(nid)
 
 
