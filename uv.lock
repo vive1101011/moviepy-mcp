@@ -813,13 +813,19 @@ wheels = [
 
 [[package]]
 name = "moviepy-mcp"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp", extra = ["apps"] },
     { name = "moviepy" },
     { name = "pillow" },
     { name = "yt-dlp" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
 ]
 
 [package.dev-dependencies]
@@ -833,8 +839,11 @@ requires-dist = [
     { name = "fastmcp", extras = ["apps"], specifier = ">=2.0" },
     { name = "moviepy", specifier = ">=2.1" },
     { name = "pillow", specifier = ">=10" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "yt-dlp", specifier = ">=2024.1.0" },
 ]
+provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [

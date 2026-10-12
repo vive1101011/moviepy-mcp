@@ -54,8 +54,7 @@ Add a `moviepy` entry under `mcpServers` (same shape as other local `uv` servers
         "run",
         "--directory",
         "C:/Users/vivek/projects/moviepy-mcp",
-        "python",
-        "src/moviepy_mcp/server.py"
+        "moviepy-mcp"
       ],
       "env": {
         "MOVIEPY_MCP_MEDIA_ROOT": "C:/Users/vivek/Videos",
@@ -82,7 +81,7 @@ If the package is installed (`pip install -e .` or `uv pip install -e .`):
 }
 ```
 
-Or without installing, via uv (one-shot deps):
+Or without installing, via uv:
 
 ```json
 {
@@ -91,12 +90,9 @@ Or without installing, via uv (one-shot deps):
       "command": "uv",
       "args": [
         "run",
-        "--with",
-        "fastmcp",
-        "--with",
-        "moviepy",
-        "python",
-        "/path/to/moviepy-mcp/src/moviepy_mcp/server.py"
+        "--directory",
+        "/path/to/moviepy-mcp",
+        "moviepy-mcp"
       ]
     }
   }
