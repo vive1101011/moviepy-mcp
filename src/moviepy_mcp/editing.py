@@ -292,8 +292,9 @@ def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
     spec = get_preset(preset) if preset else None
     clip = entry.clip
     kind = entry.kind
+    scale_args: list[str] = []
     if spec is not None:
-        clip = prepare_clip(clip, kind, spec)
+        clip, scale_args = prepare_clip(clip, kind, spec)
         if fps is None:
             fps = spec.fps
         codec = codec or spec.codec
@@ -310,6 +311,8 @@ def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
         clip.write_audiofile(output_path, **kwargs)
         return
     if ext == ".gif":
+        if scale_args:
+            clip = clip.resized(new_size=(spec.width, spec.height))
         clip.write_gif(output_path, fps=fps or 12, logger=logger)
         return
     out_fps = fps or getattr(clip, "fps", None) or 24
@@ -318,6 +321,7 @@ def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
         kwargs["codec"] = codec
     if bitrate:
         kwargs["bitrate"] = bitrate
+    audio_path = None
     if spec is not None:
         if spec.audio_codec:
             kwargs["audio_codec"] = spec.audio_codec
@@ -325,11 +329,22 @@ def _write_clip(entry: ClipEntry, output_path: str, fps: Optional[float],
             kwargs["audio_bitrate"] = spec.audio_bitrate
         if spec.pixel_format:
             kwargs["pixel_format"] = spec.pixel_format
-        extra = ["-movflags", "+faststart"]
-        if spec.loudness_lufs is not None:
-            extra.extend(loudnorm_args(spec.loudness_lufs))
-        kwargs["ffmpeg_params"] = extra
-    clip.write_videofile(output_path, **kwargs)
+        kwargs["ffmpeg_params"] = ["-movflags", "+faststart", *scale_args]
+    try:
+        if spec is not None and spec.loudness_lufs is not None and clip.audio is not None:
+            # MoviePy stream-copies audio into the final mux, so filters must run in a separate audio pass.
+            fd, audio_path = tempfile.mkstemp(suffix=".m4a")
+            os.close(fd)
+            clip.audio.write_audiofile(
+                audio_path, fps=44100, codec=spec.audio_codec or "aac",
+                bitrate=spec.audio_bitrate,
+                ffmpeg_params=loudnorm_args(spec.loudness_lufs), logger=logger,
+            )
+            kwargs["audio"] = audio_path
+        clip.write_videofile(output_path, **kwargs)
+    finally:
+        if audio_path:
+            os.remove(audio_path)
 
 def _last_frame_time(clip: Any) -> float:
     """A timestamp just before the end, safe to pass to get_frame/save_frame."""

@@ -64,8 +64,8 @@ def get_preset(name: str) -> DeliveryPreset:
     return preset
 
 
-def fit_cover(clip: Any, width: int, height: int) -> Any:
-    """Center-crop and scale so the frame fills width x height."""
+def crop_to_ratio(clip: Any, width: int, height: int) -> Any:
+    """Center-crop to the width:height aspect ratio. Does not scale."""
     src_w, src_h = clip.w, clip.h
     target_ratio = width / height
     src_ratio = src_w / src_h
@@ -75,14 +75,11 @@ def fit_cover(clip: Any, width: int, height: int) -> Any:
         new_w, new_h = src_w, round(src_w / target_ratio)
     x1 = max(0, (src_w - new_w) // 2)
     y1 = max(0, (src_h - new_h) // 2)
-    return (
-        clip.cropped(x1=x1, y1=y1, x2=x1 + new_w, y2=y1 + new_h)
-        .resized(new_size=(width, height))
-    )
+    return clip.cropped(x1=x1, y1=y1, x2=x1 + new_w, y2=y1 + new_h)
 
 
-def prepare_clip(clip: Any, kind: str, preset: DeliveryPreset) -> Any:
-    """Apply frame-size rules for a preset. Does not encode."""
+def prepare_clip(clip: Any, kind: str, preset: DeliveryPreset) -> tuple[Any, list[str]]:
+    """Apply frame-size rules for a preset. Returns the clip and extra ffmpeg args."""
     from moviepy import vfx
 
     if preset.audio_only:
@@ -91,14 +88,18 @@ def prepare_clip(clip: Any, kind: str, preset: DeliveryPreset) -> Any:
                 f"Preset '{preset.name}' is audio-only. extract_audio first, "
                 "or use a video preset."
             )
-        return clip
+        return clip, []
     if kind == "audio":
         raise ValueError(
             f"Preset '{preset.name}' renders video. Use podcast_aac for audio."
         )
     if preset.width and preset.height and (clip.w, clip.h) != (preset.width, preset.height):
-        clip = fit_cover(clip, preset.width, preset.height)
-    return clip.with_effects([vfx.EvenSize()])
+        # MoviePy resizes each frame with Pillow in Python; ffmpeg scaling is ~10x faster.
+        return (
+            crop_to_ratio(clip, preset.width, preset.height),
+            ["-vf", f"scale={preset.width}:{preset.height}:flags=lanczos"],
+        )
+    return clip.with_effects([vfx.EvenSize()]), []
 
 
 def loudnorm_args(lufs: float) -> list[str]:

@@ -719,6 +719,31 @@ async def test_load_audio_round_trip(tmp_path: Path):
         assert loaded["kind"] == "audio"
 
 
+@pytest.mark.skipif(not FFMPEG, reason="ffmpeg required")
+async def test_export_preset_with_audio(tmp_path: Path):
+    import numpy as np
+    from moviepy import ColorClip, VideoFileClip
+
+    tone = AudioClip(lambda t: 0.3 * np.sin(2 * np.pi * 440 * t), duration=0.5, fps=44100)
+    cid = _register(
+        ColorClip(size=(64, 48), color=(0, 0, 255), duration=0.5).with_fps(30).with_audio(tone),
+        "video", "blue", None, "test",
+    )
+    out_path = tmp_path / "reel.mp4"
+    async with Client(mcp) as client:
+        await client.call_tool(
+            "export_clip",
+            {"clip_id": cid, "output_path": str(out_path), "preset": "reels_1080x1920"},
+            timeout=120,
+        )
+    out = VideoFileClip(str(out_path))
+    try:
+        assert tuple(out.size) == (1080, 1920)
+        assert out.audio is not None
+    finally:
+        out.close()
+
+
 async def test_validate_download_url():
     from moviepy_mcp.editing import _validate_download_url
 
