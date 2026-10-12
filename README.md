@@ -4,13 +4,19 @@ An LLM-friendly [Model Context Protocol](https://modelcontextprotocol.io) server
 
 ## Design
 
-The server is built around an **in-memory clip registry**:
+The server is built around a **clip registry**:
 
 1. `load_video` / `load_audio` / `load_image` returns a `clip_id`.
 2. Every editing tool takes a `clip_id` and returns a **new** `clip_id` — operations chain without touching disk, and source clips are never mutated, so an agent can branch or retry any step.
-3. `export_clip` is the only tool that renders a file.
+3. `export_clip` renders a file. `preset` can be `youtube_1080p`, `reels_1080x1920`, or `podcast_aac`.
 
 Every tool returns uniform metadata (`duration_seconds`, `size`, `fps`, `has_audio`, `history`), so the model always knows the state of an edit without extra probing. Errors are actionable: they name the bad argument, list known clip_ids, and suggest the fix.
+
+Reads and writes stay inside `MOVIEPY_MCP_MEDIA_ROOT` (your home directory when unset) or the system temp directory. The registry is one session on stdio. HTTP (`MOVIEPY_MCP_TRANSPORT=http`) gives each client its own registry and requires `MOVIEPY_MCP_TOKEN`. Source files are written to `.moviepy-mcp/` under the workspace and reopened after a restart; `project_status` lists edits that were not rebuilt.
+
+The default tool list is the everyday edit path. Set `MOVIEPY_MCP_ADVANCED=1` to also expose blur, chroma key, Ken Burns, and the other effects.
+
+Code is split under `src/moviepy_mcp/`: `config`, `paths`, `registry`, `presets`, `editing`, `prompts`, and `tools/`.
 
 ## Requirements
 
@@ -50,7 +56,11 @@ Add a `moviepy` entry under `mcpServers` (same shape as other local `uv` servers
         "C:/Users/vivek/projects/moviepy-mcp",
         "python",
         "src/moviepy_mcp/server.py"
-      ]
+      ],
+      "env": {
+        "MOVIEPY_MCP_MEDIA_ROOT": "C:/Users/vivek/Videos",
+        "MOVIEPY_MCP_ADVANCED": "1"
+      }
     }
   }
 }
@@ -97,14 +107,14 @@ Or without installing, via uv (one-shot deps):
 
 | Category | Tools |
 |---|---|
-| Load / create | `load_video`, `load_audio`, `load_image`, `download_video`, `create_color_clip`, `create_text_clip`, `create_slideshow` |
-| Inspect | `list_clips`, `get_clip_info`, `preview_frame`, `delete_clip` |
+| Load / create | `load_video`, `load_audio`, `load_image`, `upload_media`, `download_video`, `create_color_clip`, `create_text_clip`, `create_slideshow` |
+| Inspect | `list_clips`, `get_clip_info`, `preview_frame`, `delete_clip`, `list_fonts`, `project_status` |
 | Time | `trim`, `concatenate`, `crossfade`, `change_speed`, `loop_clip`, `reverse_clip`, `freeze` |
 | Geometry | `resize`, `crop`, `rotate`, `mirror`, `even_size`, `reframe` |
 | Visual FX | `fade`, `to_grayscale`, `adjust_colors`, `chroma_key`, `invert_colors`, `gamma_correct`, `multiply_color`, `add_margin`, `painting`, `blur`, `sharpen`, `set_opacity`, `freeze_region`, `slide_in`, `slide_out`, `scroll`, `ken_burns` |
-| Audio | `set_volume`, `normalize_audio`, `delay_audio`, `set_stereo_volume`, `extract_audio`, `remove_audio`, `attach_audio`, `mix_audio_tracks`, `remove_silence` |
+| Audio | `set_volume`, `duck_audio`, `normalize_audio`, `delay_audio`, `set_stereo_volume`, `extract_audio`, `remove_audio`, `attach_audio`, `mix_audio_tracks`, `remove_silence` |
 | Compositing | `overlay_clip`, `grid_clips`, `add_subtitles` |
-| Output | `save_frame`, `export_image`, `export_clip` |
+| Output | `save_frame`, `export_image`, `export_clip`, `download_media` |
 
 ## Example agent workflow
 
@@ -125,7 +135,10 @@ export_clip(clip_id=..., output_path="final.mp4")
 
 - Text rendering requires a font; pass `font="/path/to/font.ttf"` to `create_text_clip` if the default is unavailable on your system.
 - GIF export uses `write_gif` (defaults to 12 fps); everything else goes through FFmpeg.
-- The registry lives in server memory — restarting the server clears all clip_ids.
+- Source clips are reopened from `.moviepy-mcp/*.json` after a restart. Derived edits are listed by `project_status` and are not rebuilt. Set `MOVIEPY_MCP_PERSIST=0` to keep nothing on disk.
+- `MOVIEPY_MCP_MAX_CLIPS` (default 48) drops the oldest clip that nothing else still uses. `MOVIEPY_MCP_MAX_WIDTH`, `MAX_HEIGHT`, and `MAX_DURATION` reject oversized media.
+- `download_video` will not read browser cookies unless `MOVIEPY_MCP_ALLOW_BROWSER_COOKIES=1`.
+- `file_manager` opens a drop zone in the chat. After upload, `list_files` returns each `clip_id`. `download_media` opens a player and download button for the finished clip; `export_clip` still writes a path you choose.
 - `preview_frame` returns an image to the model (downscaled to 640px by default). Use it after edits to verify before `export_clip`.
 - Clip metadata and a first-frame PNG are resources: `clip://{clip_id}/info` and `clip://{clip_id}/frame`.
 - `crossfade` dissolves overlapping clips; `concatenate` is still a hard cut.
