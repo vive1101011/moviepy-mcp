@@ -717,3 +717,12 @@ async def test_load_audio_round_trip(tmp_path: Path):
             await client.call_tool("load_audio", {"path": str(out_path)})
         )
         assert loaded["kind"] == "audio"
+
+
+async def test_validate_download_url():
+    from moviepy_mcp.editing import _validate_download_url
+
+    url = "https://www.instagram.com/reel/abc/"
+    assert _validate_download_url(url) == url
+    with pytest.raises(ValueError, match="Unsupported host"):
+        _validate_download_url("https://example.com/video")

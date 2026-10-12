@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastmcp import Context
 from moviepy import TextClip
